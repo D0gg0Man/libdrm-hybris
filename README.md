@@ -1,7 +1,7 @@
 **libdrm-hybris**
 
 Unified LD_PRELOAD shim for running phosh and gnome on FuriOS devices
-via the Android HWComposer2 (HWC2) backend.
+with a Mali GPU via the Android HWComposer2 (HWC2) backend.
 
 One shared object containing every shim required:
 
@@ -25,7 +25,7 @@ Tested on Furiphone FLX1 (Dimensity 900, Mali-G68 MC4) running FuriOS.
 * src/ -- shim source
 * built/ -- pre-built aarch64 binaries (shim plus companion libraries)
 
-*Install for testing*
+*Install*
 
 ```
 ./install-libdrm-hybris.sh
