@@ -80,24 +80,41 @@ done
 DRMADAPTER=$(find /usr/lib/aarch64-linux-gnu/libhybris -name "*drmadapter*" 2>/dev/null | head -1)
 [ -n "$DRMADAPTER" ] && echo "    OK: drmadapter platform: $DRMADAPTER"
 
-# Companion libraries -- built from their git repos if missing
-build_from_git() {
-    local name="$1" repo="$2" check="$3"
-    if [ -f "$check" ]; then
+# Companion libraries -- built from repo src/, with built/ as fallback
+build_companion() {
+    local name="$1" dest="$2"
+    if [ -f "$dest" ]; then
         echo "    OK: $name present"
         return 0
     fi
-    echo "    building $name from $repo"
-    local dir="/tmp/build-$name"
-    rm -rf "$dir"
-    git clone --depth 1 "$repo" "$dir" || { echo "    FAIL: clone $repo"; return 1; }
-    ( cd "$dir" && make && sudo make install ) || { echo "    FAIL: build $name"; return 1; }
-    rm -rf "$dir"
-    [ -f "$check" ] && echo "    OK: $name installed" || { echo "    FAIL: $name install did not produce $check"; return 1; }
+    if [ -f "$SCRIPT_DIR/src/$name.c" ]; then
+        echo "    building $name from src/$name.c"
+        local tmp
+        tmp="$(mktemp /tmp/$name-XXXXXX.so)"
+        if gcc -shared -fPIC -O2 \
+                -I/usr/include/libdrm \
+                -I/usr/include \
+                -I/usr/include/android \
+                -o "$tmp" "$SCRIPT_DIR/src/$name.c" \
+                -ldl -lEGL -lgralloc -ldrm -lwayland-server; then
+            sudo install -D -m 755 "$tmp" "$dest"
+            rm -f "$tmp"
+            echo "    OK: $name built and installed"
+            return 0
+        fi
+        rm -f "$tmp"
+        echo "    WARN: $name build failed, trying prebuilt"
+    fi
+    if [ -f "$SCRIPT_DIR/built/$name.so" ]; then
+        sudo install -D -m 755 "$SCRIPT_DIR/built/$name.so" "$dest"
+        echo "    OK: $name installed from built/"
+        return 0
+    fi
+    return 1
 }
 
 # wlegl_server.so -- android_wlegl protocol for client buffer sharing
-if build_from_git "wayland-android-wlegl"         "https://github.com/D0gg0Man/wayland-android-wlegl.git"         "/usr/local/lib/wlegl_server.so"; then
+if build_companion "wlegl_server" "/usr/local/lib/wlegl_server.so"; then
     WLEGL="/usr/local/lib/wlegl_server.so"
 else
     echo "    WARN: phosh buffer sharing will fail without wlegl_server.so"
@@ -106,13 +123,14 @@ fi
 
 # eglplatform_drmadapter.so -- hybris EGL platform for the phosh client
 if [ -z "$DRMADAPTER" ]; then
-    if build_from_git "eglplatform-drmadapter"             "https://github.com/D0gg0Man/eglplatform-drmadapter.git"             "/usr/lib/aarch64-linux-gnu/libhybris/eglplatform_drmadapter.so"; then
+    if build_companion "eglplatform_drmadapter" \
+            "/usr/lib/aarch64-linux-gnu/libhybris/eglplatform_drmadapter.so"; then
         DRMADAPTER="/usr/lib/aarch64-linux-gnu/libhybris/eglplatform_drmadapter.so"
     fi
 fi
 
 # vulkan_x11_stub.so -- optional, silences Vulkan loader
-if [ -f /usr/local/lib/vulkan_x11_stub.so ]; then
+if build_companion "vulkan_x11_stub" "/usr/local/lib/vulkan_x11_stub.so"; then
     VULKAN="/usr/local/lib/vulkan_x11_stub.so"
 else
     echo "    WARN: vulkan_x11_stub.so missing -- optional, Vulkan apps may log errors"
