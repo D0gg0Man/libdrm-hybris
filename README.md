@@ -40,11 +40,6 @@ reliable interception point), adds it to /etc/ld.so.preload, adds the
 greeter user to the input group, and installs the phosh EGL drop-in so
 phosh renders as a Wayland client via the drmadapter platform.
 
-Companion repositories built from source by the installer when missing:
-
-* https://github.com/D0gg0Man/wayland-android-wlegl
-* https://github.com/D0gg0Man/eglplatform-drmadapter
-sources in project
 *Build only*
 
 ```
