@@ -270,51 +270,20 @@ EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config,
     if (!real_fn) real_fn = resolve_next("eglGetConfigAttrib", (void *)eglGetConfigAttrib);
     if (!real_fn) return EGL_FALSE;
     EGLBoolean r = real_fn(dpy, config, attribute, value);
-    /* Only the compositor needs the visual-id fix. Clients (Qt camera apps
-     * etc) must see the unmodified value or their EGL config selection breaks. */
-    if (r && is_compositor() && attribute == EGL_NATIVE_VISUAL_ID && *value == 0) {
+    /* Visual-id fix is ONLY for wlroots/phoc (phosh), which needs a non-zero
+     * EGL_NATIVE_VISUAL_ID to select a config. It must NOT run for:
+     *  - clients (Qt camera apps) -- they need the unmodified value
+     *  - gnome/mutter -- the drmadapter EGL platform does the proper fourcc
+     *    mapping itself; our forcing it to 1 breaks mutter's GBM format match
+     *    ("No EGL config matching supported GBM format found"). */
+    if (r && is_compositor() && !is_gnome() &&
+        attribute == EGL_NATIVE_VISUAL_ID && *value == 0) {
         EGLint red=0, green=0, blue=0, alpha=0;
         real_fn(dpy,config,EGL_RED_SIZE,&red);   real_fn(dpy,config,EGL_GREEN_SIZE,&green);
         real_fn(dpy,config,EGL_BLUE_SIZE,&blue); real_fn(dpy,config,EGL_ALPHA_SIZE,&alpha);
         if (red==8 && green==8 && blue==8 && alpha==8) *value = 1;
     }
     return r;
-}
-
-/* gnome-shell uses eglGetPlatformDisplay to get the hybris EGL display */
-static EGLDisplay our_egl_display = EGL_NO_DISPLAY;
-
-static void init_our_display(void) {
-    if (our_egl_display != EGL_NO_DISPLAY) return;
-    void *lib = dlopen("libEGL_hybris_wrapper.so", RTLD_NOW | RTLD_NOLOAD);
-    if (!lib) lib = dlopen("libEGL_hybris_wrapper.so", RTLD_NOW);
-    if (lib) {
-        typedef EGLDisplay (*fn_t)(EGLenum, void *, const EGLAttrib *);
-        fn_t fn = (fn_t)dlsym(lib, "wrapped_getPlatformDisplay");
-        if (fn) our_egl_display = fn(0x31D7, (void *)1, NULL);
-    }
-}
-
-EGLDisplay eglGetPlatformDisplayEXT(EGLenum platform, void *native,
-                                    const EGLint *attribs) {
-    if (is_compositor() && is_gnome()) {
-        init_our_display();
-        if (our_egl_display != EGL_NO_DISPLAY) return our_egl_display;
-    }
-    typedef EGLDisplay (*fn_t)(EGLenum, void *, const EGLint *);
-    fn_t real = (fn_t)dlsym(RTLD_NEXT, "eglGetPlatformDisplayEXT");
-    return real ? real(platform, native, attribs) : EGL_NO_DISPLAY;
-}
-
-EGLDisplay eglGetPlatformDisplay(EGLenum platform, void *native,
-                                 const EGLAttrib *attribs) {
-    if (is_compositor() && is_gnome()) {
-        init_our_display();
-        if (our_egl_display != EGL_NO_DISPLAY) return our_egl_display;
-    }
-    typedef EGLDisplay (*fn_t)(EGLenum, void *, const EGLAttrib *);
-    fn_t real = (fn_t)dlsym(RTLD_NEXT, "eglGetPlatformDisplay");
-    return real ? real(platform, native, attribs) : EGL_NO_DISPLAY;
 }
 
 /* ==========================================================================
