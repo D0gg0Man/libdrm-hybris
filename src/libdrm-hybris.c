@@ -35,18 +35,49 @@
 #include <EGL/eglext.h>
 #include <wayland-server.h>
 
+/* Process-scope gate. This library is loaded system-wide via ld.so.preload
+ * and as libseat.so.1, so it lands inside ordinary EGL clients (Qt camera
+ * apps, etc) too. Those must pass straight through -- our EGL/DRM/HWC2
+ * intercepts are only correct inside the compositor process. We detect the
+ * compositor by executable name; everything else gets pass-through behavior.
+ *
+ * libseat interception is the exception: it must always be active because
+ * the whole point is that phoc (the compositor) calls libseat, and phoc IS
+ * a compositor. Non-compositors that call libseat (rare) still get our fake,
+ * which is harmless -- they would have used seatd otherwise. */
+static int is_compositor(void) {
+    static int cached = -1;
+    if (cached != -1) return cached;
+    char buf[256] = {0};
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n < 0) { cached = 0; return 0; }
+    buf[n] = '\0';
+    /* Match on the basename of known compositors that drive HWC2 directly */
+    const char *base = strrchr(buf, '/');
+    base = base ? base + 1 : buf;
+    cached =
+        strcmp(base, "phoc") == 0        ||
+        strcmp(base, "gnome-shell") == 0 ||
+        strcmp(base, "mutter") == 0      ||
+        strcmp(base, "weston") == 0      ||
+        strcmp(base, "wlroots") == 0     ||
+        strstr(base, "kwin") != NULL     ||
+        strcmp(base, "sway") == 0;
+    return cached;
+}
+
 /* Runtime session detection */
 static int is_gnome(void) {
     const char *d = getenv("XDG_SESSION_DESKTOP");
     if (d && strcmp(d, "gnome") == 0) return 1;
-    /* gnome unsets XDG_SESSION_DESKTOP before import-environment,
+    /* gnome-mali unsets XDG_SESSION_DESKTOP before import-environment,
      * so fall back to XDG_CURRENT_DESKTOP. Exact match "GNOME" only --
-     * phosh uses "Phosh:GNOME" which must NOT match. TODO add more detections */
+     * phosh uses "Phosh:GNOME" which must NOT match. */
     d = getenv("XDG_CURRENT_DESKTOP");
     return d && strcmp(d, "GNOME") == 0;
 }
 
-/* only inject wlegl into gnome-shell itself, not every
+/* BUG 4 fix: only inject wlegl into gnome-shell itself, not every
  * wayland server that happens to run in a gnome session */
 static int is_gnome_shell(void) {
     char buf[256] = {0};
@@ -56,7 +87,7 @@ static int is_gnome_shell(void) {
     return strstr(buf, "gnome-shell") != NULL;
 }
 
-/* resolve the real symbol safely. When this library is
+/* BUG 2 fix: resolve the real symbol safely. When this library is
  * installed both as libseat.so.1 AND via ld.so.preload, RTLD_NEXT from
  * the preloaded copy resolves to the libseat.so.1 copy of the SAME
  * function (at a different address), causing infinite recursion.
@@ -135,7 +166,7 @@ struct libseat *libseat_open_seat(const struct libseat_seat_listener *l, void *u
     return (struct libseat *)&_fake_seat;
 }
 int libseat_open_device(struct libseat *s, const char *path, int *fd) {
-    /* O_NONBLOCK is critical!!!!!! -- without it the GLib main loop blocks in
+    /* O_NONBLOCK is critical -- without it the GLib main loop blocks in
      * evdev_read and the wlroots frame timer callbacks never fire. */
     int f = open(path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
     if (f < 0) return -1;
@@ -164,15 +195,30 @@ void        libseat_set_log_level(int level)                 { (void)level; }
  * 2. DRM CAPS -- render node advertisement, capability patches
  * ========================================================================== */
 
-char *drmGetRenderDeviceNameFromFd(int fd) { return strdup("/dev/dri/card0"); }
-int   drmGetNodeTypeFromFd(int fd)         { return DRM_NODE_PRIMARY; }
+char *drmGetRenderDeviceNameFromFd(int fd) {
+    if (!is_compositor()) {
+        typedef char *(*fn_t)(int);
+        fn_t real=(fn_t)resolve_next("drmGetRenderDeviceNameFromFd",
+                                     (void*)drmGetRenderDeviceNameFromFd);
+        return real ? real(fd) : NULL;
+    }
+    return strdup("/dev/dri/card0");
+}
+int drmGetNodeTypeFromFd(int fd) {
+    if (!is_compositor()) {
+        typedef int (*fn_t)(int);
+        fn_t real=(fn_t)resolve_next("drmGetNodeTypeFromFd",(void*)drmGetNodeTypeFromFd);
+        return real ? real(fd) : -1;
+    }
+    return DRM_NODE_PRIMARY;
+}
 
 int drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device) {
     static int (*real_fn)(int, uint32_t, drmDevicePtr *) = NULL;
     if (!real_fn) real_fn = resolve_next("drmGetDevice2", (void *)drmGetDevice2);
     if (!real_fn) return -ENOSYS;
     int r = real_fn(fd, flags, device);
-    if (r == 0 && *device) {
+    if (r == 0 && *device && is_compositor()) {
         (*device)->available_nodes |= (1 << DRM_NODE_RENDER);
         (*device)->nodes[DRM_NODE_RENDER] = strdup((*device)->nodes[DRM_NODE_PRIMARY]);
     }
@@ -181,20 +227,37 @@ int drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device) {
 int drmGetCap(int fd, uint64_t cap, uint64_t *value) {
     static int (*real_fn)(int, uint64_t, uint64_t *) = NULL;
     if (!real_fn) real_fn = resolve_next("drmGetCap", (void *)drmGetCap);
-    switch (cap) {
-        case DRM_CAP_PRIME:                 *value = DRM_PRIME_CAP_IMPORT|DRM_PRIME_CAP_EXPORT; return 0;
-        case DRM_CAP_CRTC_IN_VBLANK_EVENT: *value = 1; return 0;
-        case DRM_CAP_TIMESTAMP_MONOTONIC:  *value = 1; return 0;
-        default: return real_fn ? real_fn(fd, cap, value) : -ENOSYS;
+    if (is_compositor()) {
+        switch (cap) {
+            case DRM_CAP_PRIME:                 *value = DRM_PRIME_CAP_IMPORT|DRM_PRIME_CAP_EXPORT; return 0;
+            case DRM_CAP_CRTC_IN_VBLANK_EVENT: *value = 1; return 0;
+            case DRM_CAP_TIMESTAMP_MONOTONIC:  *value = 1; return 0;
+            default: break;
+        }
     }
+    return real_fn ? real_fn(fd, cap, value) : -ENOSYS;
 }
 int drmSetClientCap(int fd, uint64_t cap, uint64_t value) {
     static int (*real_fn)(int, uint64_t, uint64_t) = NULL;
     if (!real_fn) real_fn = resolve_next("drmSetClientCap", (void *)drmSetClientCap);
     return real_fn ? real_fn(fd, cap, value) : -ENOSYS;
 }
-int drmIsKMS(int fd) { return 1; }
-int drmModeCreateLease(int fd, const uint32_t *o, int n, int f, uint32_t *id) { return -EINVAL; }
+int drmIsKMS(int fd) {
+    if (!is_compositor()) {
+        typedef int (*fn_t)(int);
+        fn_t real=(fn_t)resolve_next("drmIsKMS",(void*)drmIsKMS);
+        return real ? real(fd) : 0;
+    }
+    return 1;
+}
+int drmModeCreateLease(int fd, const uint32_t *o, int n, int f, uint32_t *id) {
+    if (!is_compositor()) {
+        typedef int (*fn_t)(int,const uint32_t*,int,int,uint32_t*);
+        fn_t real=(fn_t)resolve_next("drmModeCreateLease",(void*)drmModeCreateLease);
+        return real ? real(fd,o,n,f,id) : -EINVAL;
+    }
+    return -EINVAL;
+}
 
 
 /* ==========================================================================
@@ -207,9 +270,9 @@ EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config,
     if (!real_fn) real_fn = resolve_next("eglGetConfigAttrib", (void *)eglGetConfigAttrib);
     if (!real_fn) return EGL_FALSE;
     EGLBoolean r = real_fn(dpy, config, attribute, value);
-    /* Android EGL returns 0 for EGL_NATIVE_VISUAL_ID on RGBA8888 configs;
-     * wlroots requires a non-zero value to select a config. */
-    if (r && attribute == EGL_NATIVE_VISUAL_ID && *value == 0) {
+    /* Only the compositor needs the visual-id fix. Clients (Qt camera apps
+     * etc) must see the unmodified value or their EGL config selection breaks. */
+    if (r && is_compositor() && attribute == EGL_NATIVE_VISUAL_ID && *value == 0) {
         EGLint red=0, green=0, blue=0, alpha=0;
         real_fn(dpy,config,EGL_RED_SIZE,&red);   real_fn(dpy,config,EGL_GREEN_SIZE,&green);
         real_fn(dpy,config,EGL_BLUE_SIZE,&blue); real_fn(dpy,config,EGL_ALPHA_SIZE,&alpha);
@@ -234,7 +297,7 @@ static void init_our_display(void) {
 
 EGLDisplay eglGetPlatformDisplayEXT(EGLenum platform, void *native,
                                     const EGLint *attribs) {
-    if (is_gnome()) {
+    if (is_compositor() && is_gnome()) {
         init_our_display();
         if (our_egl_display != EGL_NO_DISPLAY) return our_egl_display;
     }
@@ -245,7 +308,7 @@ EGLDisplay eglGetPlatformDisplayEXT(EGLenum platform, void *native,
 
 EGLDisplay eglGetPlatformDisplay(EGLenum platform, void *native,
                                  const EGLAttrib *attribs) {
-    if (is_gnome()) {
+    if (is_compositor() && is_gnome()) {
         init_our_display();
         if (our_egl_display != EGL_NO_DISPLAY) return our_egl_display;
     }
@@ -305,13 +368,20 @@ void HWCNativeWindowSetBufferCount(HWCNativeWindow *win, int count) {
     static void (*real_fn)(HWCNativeWindow *, int) = NULL;
     if (!real_fn) real_fn = resolve_next("HWCNativeWindowSetBufferCount",
                                          (void *)HWCNativeWindowSetBufferCount);
-    if (real_fn) real_fn(win, 2);
+    /* Only force double-buffering in the compositor. Clients keep their count. */
+    if (real_fn) real_fn(win, is_compositor() ? 2 : count);
 }
 
 void HWCNativeBufferSetFence(ANativeWindowBuffer *buffer, int fd) {
     static void (*real_fn)(ANativeWindowBuffer *, int) = NULL;
     if (!real_fn) real_fn = resolve_next("HWCNativeBufferSetFence",
                                          (void *)HWCNativeBufferSetFence);
+    /* Only discard fences in the compositor. Clients need their real fence
+     * preserved or buffer sync breaks (camera preview texture corruption). */
+    if (!is_compositor()) {
+        if (real_fn) real_fn(buffer, fd);
+        return;
+    }
     if (real_fn) real_fn(buffer, -1);
     if (fd >= 0) close(fd);
 }
@@ -413,6 +483,13 @@ static int init_dumb(int fd) {
 int drmModeAddFB2WithModifiers(int fd, uint32_t w, uint32_t h, uint32_t fmt,
     const uint32_t handles[4], const uint32_t pitches[4], const uint32_t offsets[4],
     const uint64_t mod[4], uint32_t *buf_id, uint32_t flags) {
+    if (!is_compositor()) {
+        typedef int (*fn_t)(int,uint32_t,uint32_t,uint32_t,const uint32_t*,
+                            const uint32_t*,const uint32_t*,const uint64_t*,uint32_t*,uint32_t);
+        fn_t real=(fn_t)resolve_next("drmModeAddFB2WithModifiers",
+                                     (void*)drmModeAddFB2WithModifiers);
+        return real ? real(fd,w,h,fmt,handles,pitches,offsets,mod,buf_id,flags) : -ENOSYS;
+    }
     if (!frame_w) { frame_w=w; frame_h=h; }
     if (!dumb_map) init_dumb(fd);
     uint32_t id=next_fake++; *buf_id=id; fmap_insert(handles[0],id); return 0;
@@ -420,22 +497,47 @@ int drmModeAddFB2WithModifiers(int fd, uint32_t w, uint32_t h, uint32_t fmt,
 int drmModeAddFB2(int fd, uint32_t w, uint32_t h, uint32_t fmt,
     const uint32_t handles[4], const uint32_t pitches[4], const uint32_t offsets[4],
     uint32_t *buf_id, uint32_t flags) {
+    if (!is_compositor()) {
+        typedef int (*fn_t)(int,uint32_t,uint32_t,uint32_t,const uint32_t*,
+                            const uint32_t*,const uint32_t*,uint32_t*,uint32_t);
+        fn_t real=(fn_t)resolve_next("drmModeAddFB2",(void*)drmModeAddFB2);
+        return real ? real(fd,w,h,fmt,handles,pitches,offsets,buf_id,flags) : -ENOSYS;
+    }
     if (!frame_w) { frame_w=w; frame_h=h; }
     if (!dumb_map) init_dumb(fd);
     uint32_t id=next_fake++; *buf_id=id; fmap_insert(handles[0],id); return 0;
 }
-int drmModeRmFB(int fd, uint32_t id) { return 0; }
+int drmModeRmFB(int fd, uint32_t id) {
+    if (!is_compositor()) {
+        typedef int (*fn_t)(int,uint32_t);
+        fn_t real=(fn_t)resolve_next("drmModeRmFB",(void*)drmModeRmFB);
+        return real ? real(fd,id) : 0;
+    }
+    return 0;
+}
 int drmModeSetCrtc(int fd, uint32_t crtcId, uint32_t bufferId, uint32_t x, uint32_t y,
     uint32_t *connectors, int count, drmModeModeInfoPtr mode) {
+    if (!is_compositor()) {
+        typedef int (*fn_t)(int,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t*,int,drmModeModeInfoPtr);
+        fn_t real=(fn_t)resolve_next("drmModeSetCrtc",(void*)drmModeSetCrtc);
+        return real ? real(fd,crtcId,bufferId,x,y,connectors,count,mode) : -ENOSYS;
+    }
     if (!dumb_map) init_dumb(fd); crtc_set=1; return 0;
 }
 int drmModePageFlip(int fd, uint32_t crtc_id, uint32_t fb_id, uint32_t flags, void *ud) {
-    buffer_handle_t h=find_by_fb(fb_id); copy_to_dumb(h);
     typedef int (*fn_t)(int,uint32_t,uint32_t,uint32_t,void*);
     fn_t real=(fn_t)resolve_next("drmModePageFlip",(void*)drmModePageFlip);
+    if (!is_compositor())
+        return real ? real(fd,crtc_id,fb_id,flags,ud) : -ENOSYS;
+    buffer_handle_t h=find_by_fb(fb_id); copy_to_dumb(h);
     return real ? real(fd,crtc_id,dumb_fb_id?dumb_fb_id:fb_id,flags,ud) : 0;
 }
 int drmModeAtomicCommit(int fd, drmModeAtomicReqPtr req, uint32_t flags, void *ud) {
+    if (!is_compositor()) {
+        typedef int (*fn_t)(int,drmModeAtomicReqPtr,uint32_t,void*);
+        fn_t real=(fn_t)resolve_next("drmModeAtomicCommit",(void*)drmModeAtomicCommit);
+        return real ? real(fd,req,flags,ud) : -ENOSYS;
+    }
     for (int i=fmap_n-1; i>=0; i--) {
         buffer_handle_t h=find_gralloc(fmap[i].gem);
         if (h) { copy_to_dumb(h); break; }
@@ -448,6 +550,9 @@ int ioctl(int fd, unsigned long request, ...) {
     va_list args; va_start(args,request); void *arg=va_arg(args,void*); va_end(args);
     uint32_t magic=(request>>8)&0xff;
     if (magic != 0x64) return real_ioctl(fd,request,arg);
+    /* Only the compositor's DRM ioctls drive the fake KMS framebuffer.
+     * Client processes (camera etc) must reach the real DRM driver intact. */
+    if (!is_compositor()) return real_ioctl(fd,request,arg);
     if (in_hook) return real_ioctl(fd,request,arg);
     uint32_t nr=request&0xff;
     in_hook=1; int ret;
