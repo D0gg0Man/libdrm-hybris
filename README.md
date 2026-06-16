@@ -22,12 +22,14 @@ Tested on Furiphone FLX1 (Dimensity 900, Mali-G68 MC4) running FuriOS.
 
 *Layout*
 
-* src/ -- all sources: the unified shim (libdrm-hybris.c) plus the
-  companion libraries (wlegl_server.c, eglplatform_drmadapter.c,
-  vulkan_x11_stub.c)
+* src/ -- the unified shim (libdrm-hybris.c) plus companion libraries
+  (wlegl_server.c)
 * built/ -- pre-built aarch64 binaries of everything in src/
 
-*Install for testing*
+The drmadapter EGL platform lives in-tree in libhybris:
+https://github.com/D0gg0Man/libhybris/tree/gnome-mali-drmadapter
+
+*Install*
 
 ```
 ./install-libdrm-hybris.sh
@@ -40,11 +42,7 @@ reliable interception point), adds it to /etc/ld.so.preload, adds the
 greeter user to the input group, and installs the phosh EGL drop-in so
 phosh renders as a Wayland client via the drmadapter platform.
 
-Companion repositories built from source by the installer when missing:
 
-* https://github.com/D0gg0Man/wayland-android-wlegl
-* https://github.com/D0gg0Man/eglplatform-drmadapter
-sources in project
 *Build only*
 
 ```
@@ -52,4 +50,9 @@ make
 sudo make install
 ```
 
+*Known limitations*
 
+Screen tearing at high refresh rates is a structural limitation of the
+wlroots hwcomposer backend's synchronous sync_wait() fence architecture.
+The stock FuriOS phosh session has the same behaviour. The proper fix is
+a wlroots patch moving the fence wait off the main thread.
