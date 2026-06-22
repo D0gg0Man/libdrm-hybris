@@ -375,7 +375,6 @@ static void     *dumb_map    = NULL;
 static size_t    dumb_size   = 0;
 static uint32_t  next_fake   = 0x80000000u;
 static __thread int in_hook  = 0;
-static int       crtc_set    = 0;
 
 typedef int (*ioctl_t)(int, unsigned long, ...);
 static ioctl_t real_ioctl = NULL;
@@ -412,6 +411,12 @@ static void fmap_insert(uint32_t gem, uint32_t fb_id) {
     else { slot = fmap_evict; fmap_evict = (fmap_evict + 1) % MAX; }
     fmap[slot].gem = gem; fmap[slot].fb_id = fb_id;
 }
+/* NB: the dumb buffer is never actually scanned out (the HWC2 composer owns the
+ * CRTC; real pixels reach the panel via the drmadapter EGL path). HOWEVER the
+ * per-frame gralloc lock/unlock in copy_to_dumb() is load-bearing -- removing it
+ * makes gnome-session stop the shell after ~43s (verified on-device). The lock/
+ * unlock is evidently a GPU/cache sync the HWC2 presentation relies on, so keep
+ * it. (The dumb FB also gives mutter a real FB id to page-flip to.) */
 static void copy_to_dumb(buffer_handle_t h) {
     if (!dumb_map || !h || !frame_w || !frame_h) return;
     void *src = NULL;
@@ -491,7 +496,7 @@ int drmModeSetCrtc(int fd, uint32_t crtcId, uint32_t bufferId, uint32_t x, uint3
         fn_t real=(fn_t)resolve_next("drmModeSetCrtc",(void*)drmModeSetCrtc);
         return real ? real(fd,crtcId,bufferId,x,y,connectors,count,mode) : -ENOSYS;
     }
-    if (!dumb_map) init_dumb(fd); crtc_set=1; return 0;
+    if (!dumb_map) init_dumb(fd); return 0;
 }
 int drmModePageFlip(int fd, uint32_t crtc_id, uint32_t fb_id, uint32_t flags, void *ud) {
     typedef int (*fn_t)(int,uint32_t,uint32_t,uint32_t,void*);
@@ -533,13 +538,12 @@ int ioctl(int fd, unsigned long request, ...) {
     } else if (nr==0xaf) { ret=real_ioctl(fd,request,arg);
     } else if (nr==0xa2) {
         if (!dumb_map) init_dumb(fd);
-        real_ioctl(fd,request,arg); crtc_set=1; ret=0;
+        real_ioctl(fd,request,arg); ret=0;
     } else if (nr==0xb0||nr==0xb6) {
         struct drm_mode_crtc_page_flip *flip=arg;
         buffer_handle_t h=find_by_fb(flip->fb_id); copy_to_dumb(h);
         if (dumb_fb_id) flip->fb_id=dumb_fb_id;
         ret=real_ioctl(fd,request,arg);
-        if (ret!=0) crtc_set=0;
     } else if (nr==0xbc) {
         for (int i=fmap_n-1; i>=0; i--) {
             buffer_handle_t h=find_gralloc(fmap[i].gem);
