@@ -27,6 +27,8 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <stdarg.h>
+#include <poll.h>
+#include <time.h>
 #include <android/android-config.h>
 #include <hybris/gralloc/gralloc.h>
 #include <xf86drm.h>
@@ -383,6 +385,119 @@ static void ensure_real(void) {
     if (!real_ioctl) real_ioctl = (ioctl_t)resolve_next("ioctl", (void *)ioctl);
 }
 
+/* Env-gated tracing (LIBDRM_HYBRIS_TRACE=1). */
+static int trace_on = -1;
+static void tracef(const char *fmt, ...) {
+    if (trace_on < 0) trace_on = getenv("LIBDRM_HYBRIS_TRACE") ? 1 : 0;
+    if (!trace_on) return;
+    int saved = in_hook; in_hook = 1;
+    FILE *f = fopen("/tmp/libdrm-hybris-trace.log", "a");
+    if (f) { va_list a; va_start(a, fmt); vfprintf(f, fmt, a); va_end(a); fclose(f); }
+    in_hook = saved;
+}
+
+/* ------------------------------------------------------------------------
+ * Synthetic page-flip completion events (decouple mutter's frame clock from
+ * card0 DRM master, which the HWC2 composer permanently owns). On an output
+ * reconfigure the timing flips start returning EACCES; we then synthesize the
+ * DRM_EVENT_FLIP_COMPLETE ourselves, paced at the interval measured from the
+ * real flips. The poll/read hooks fast-path out via g_synth_active.
+ * ---------------------------------------------------------------------- */
+static int      g_synth_active   = 0;
+static int      g_drm_fd         = -1;
+static int      g_synth_pending  = 0;
+static uint32_t g_synth_crtc     = 0;
+static uint64_t g_synth_user     = 0;
+static uint64_t g_interval_ns    = 0;
+static uint64_t g_last_flip_ns   = 0;
+static uint64_t g_deadline_ns    = 0;
+static uint32_t g_synth_seq      = 0;
+
+static ssize_t (*real_read)(int, void *, size_t) = NULL;
+static int     (*real_poll)(struct pollfd *, nfds_t, int) = NULL;
+static int     (*real_ppoll)(struct pollfd *, nfds_t, const struct timespec *, const sigset_t *) = NULL;
+
+static uint64_t now_ns(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec;
+}
+static void synth_note_flip(void) {
+    uint64_t n = now_ns();
+    if (g_last_flip_ns) {
+        uint64_t d = n - g_last_flip_ns;
+        if (d > 1000000ull && d < 100000000ull)
+            g_interval_ns = g_interval_ns ? (g_interval_ns * 7 + d) / 8 : d;
+    }
+    g_last_flip_ns = n;
+}
+static void synth_arm(uint32_t crtc, uint64_t user_data) {
+    g_synth_crtc = crtc;
+    g_synth_user = user_data;
+    g_deadline_ns = now_ns() + (g_interval_ns ? g_interval_ns : 8333333ull);
+    g_synth_pending = 1;
+    g_synth_active = 1;
+}
+
+ssize_t read(int fd, void *buf, size_t count) {
+    if (!real_read) real_read = (ssize_t(*)(int,void*,size_t))resolve_next("read",(void*)read);
+    if (!g_synth_active || fd != g_drm_fd || !g_synth_pending || in_hook)
+        return real_read(fd, buf, count);
+    if (now_ns() < g_deadline_ns) return real_read(fd, buf, count);
+    if (count < sizeof(struct drm_event_vblank)) return real_read(fd, buf, count);
+    struct drm_event_vblank ev; memset(&ev, 0, sizeof ev);
+    ev.base.type   = DRM_EVENT_FLIP_COMPLETE;
+    ev.base.length = sizeof ev;
+    ev.user_data   = g_synth_user;
+    uint64_t n = now_ns();
+    ev.tv_sec  = (uint32_t)(n / 1000000000ull);
+    ev.tv_usec = (uint32_t)((n / 1000ull) % 1000000ull);
+    ev.sequence = ++g_synth_seq;
+    ev.crtc_id  = g_synth_crtc;
+    memcpy(buf, &ev, sizeof ev);
+    g_synth_pending = 0;
+    tracef("SYNTH read delivered crtc=%u user=0x%llx seq=%u\n", g_synth_crtc, (unsigned long long)g_synth_user, g_synth_seq);
+    return sizeof ev;
+}
+static int synth_poll_fixup(struct pollfd *fds, nfds_t n, struct timespec *cap) {
+    if (!g_synth_active || !g_synth_pending) return -1;
+    int idx = -1;
+    for (nfds_t i = 0; i < n; i++)
+        if (fds[i].fd == g_drm_fd && (fds[i].events & POLLIN)) { idx = (int)i; break; }
+    if (idx < 0) return -1;
+    int64_t rem = (int64_t)g_deadline_ns - (int64_t)now_ns();
+    if (rem <= 0) { fds[idx].revents |= POLLIN; return idx; }
+    if (cap) { cap->tv_sec = rem / 1000000000; cap->tv_nsec = rem % 1000000000; }
+    return -2;
+}
+int poll(struct pollfd *fds, nfds_t n, int timeout) {
+    if (!real_poll) real_poll = (int(*)(struct pollfd*,nfds_t,int))resolve_next("poll",(void*)poll);
+    if (!g_synth_active || in_hook) return real_poll(fds, n, timeout);
+    struct timespec cap;
+    int r = synth_poll_fixup(fds, n, &cap);
+    if (r >= 0) return 1;
+    if (r == -2) { int ms = (int)((cap.tv_sec*1000000000ll+cap.tv_nsec)/1000000)+1; if (timeout < 0 || timeout > ms) timeout = ms; }
+    int got = real_poll(fds, n, timeout);
+    if (got == 0 && g_synth_pending && now_ns() >= g_deadline_ns)
+        for (nfds_t i = 0; i < n; i++)
+            if (fds[i].fd == g_drm_fd && (fds[i].events & POLLIN)) { fds[i].revents |= POLLIN; return 1; }
+    return got;
+}
+int ppoll(struct pollfd *fds, nfds_t n, const struct timespec *to, const sigset_t *ss) {
+    if (!real_ppoll) real_ppoll = (int(*)(struct pollfd*,nfds_t,const struct timespec*,const sigset_t*))resolve_next("ppoll",(void*)ppoll);
+    if (!g_synth_active || in_hook) return real_ppoll(fds, n, to, ss);
+    struct timespec cap;
+    int r = synth_poll_fixup(fds, n, &cap);
+    if (r >= 0) return 1;
+    const struct timespec *eff = to;
+    if (r == -2 && (!to || (uint64_t)to->tv_sec*1000000000ull+to->tv_nsec > (uint64_t)cap.tv_sec*1000000000ull+cap.tv_nsec))
+        eff = &cap;
+    int got = real_ppoll(fds, n, eff, ss);
+    if (got == 0 && g_synth_pending && now_ns() >= g_deadline_ns)
+        for (nfds_t i = 0; i < n; i++)
+            if (fds[i].fd == g_drm_fd && (fds[i].events & POLLIN)) { fds[i].revents |= POLLIN; return 1; }
+    return got;
+}
+
 static int gmap_evict = 0;
 void drm_shim_register_bo(uint32_t prime_fd, buffer_handle_t gralloc) {
     for (int i = 0; i < gmap_n; i++)
@@ -503,8 +618,15 @@ int drmModePageFlip(int fd, uint32_t crtc_id, uint32_t fb_id, uint32_t flags, vo
     fn_t real=(fn_t)resolve_next("drmModePageFlip",(void*)drmModePageFlip);
     if (!is_compositor())
         return real ? real(fd,crtc_id,fb_id,flags,ud) : -ENOSYS;
+    g_drm_fd = fd; synth_note_flip();
     buffer_handle_t h=find_by_fb(fb_id); copy_to_dumb(h);
-    return real ? real(fd,crtc_id,dumb_fb_id?dumb_fb_id:fb_id,flags,ud) : 0;
+    int r = real ? real(fd,crtc_id,dumb_fb_id?dumb_fb_id:fb_id,flags,ud) : 0;
+    if (r == -EACCES) {
+        if (flags & DRM_MODE_PAGE_FLIP_EVENT)
+            synth_arm(crtc_id, (uint64_t)(uintptr_t)ud);
+        r = 0;
+    }
+    return r;
 }
 int drmModeAtomicCommit(int fd, drmModeAtomicReqPtr req, uint32_t flags, void *ud) {
     if (!is_compositor()) {
@@ -541,9 +663,15 @@ int ioctl(int fd, unsigned long request, ...) {
         real_ioctl(fd,request,arg); ret=0;
     } else if (nr==0xb0||nr==0xb6) {
         struct drm_mode_crtc_page_flip *flip=arg;
+        g_drm_fd=fd; synth_note_flip();
         buffer_handle_t h=find_by_fb(flip->fb_id); copy_to_dumb(h);
         if (dumb_fb_id) flip->fb_id=dumb_fb_id;
         ret=real_ioctl(fd,request,arg);
+        if (ret!=0 && errno==EACCES) {
+            if (flip->flags & DRM_MODE_PAGE_FLIP_EVENT)
+                synth_arm(flip->crtc_id, flip->user_data);
+            ret=0;
+        }
     } else if (nr==0xbc) {
         for (int i=fmap_n-1; i>=0; i--) {
             buffer_handle_t h=find_gralloc(fmap[i].gem);
