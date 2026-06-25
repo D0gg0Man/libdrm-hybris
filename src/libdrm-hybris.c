@@ -242,7 +242,17 @@ int drmGetCap(int fd, uint64_t cap, uint64_t *value) {
 int drmSetClientCap(int fd, uint64_t cap, uint64_t value) {
     static int (*real_fn)(int, uint64_t, uint64_t) = NULL;
     if (!real_fn) real_fn = resolve_next("drmSetClientCap", (void *)drmSetClientCap);
-    return real_fn ? real_fn(fd, cap, value) : -ENOSYS;
+    int r = real_fn ? real_fn(fd, cap, value) : -ENOSYS;
+    /* wlroots/phoc: ATOMIC + UNIVERSAL_PLANES must really be set on the fd so
+     * the kernel exposes the primary/cursor planes and the atomic uAPI -- pass
+     * them through (the MediaTek DRM is a real atomic driver and accepts them).
+     * Only if the driver rejects one (e.g. because the HWC2 composer owns the
+     * master) do we pretend success, so wlroots still takes the atomic path
+     * where our faked drmModeAtomicCommit() works. Not for gnome/mutter. */
+    if (r != 0 && is_compositor() && !is_gnome() &&
+        (cap == DRM_CLIENT_CAP_ATOMIC || cap == DRM_CLIENT_CAP_UNIVERSAL_PLANES))
+        return 0;
+    return r;
 }
 int drmIsKMS(int fd) {
     if (!is_compositor()) {
@@ -595,6 +605,20 @@ int drmModeAddFB2(int fd, uint32_t w, uint32_t h, uint32_t fmt,
     if (!frame_w) { frame_w=w; frame_h=h; }
     if (!dumb_map) init_dumb(fd);
     uint32_t id=next_fake++; *buf_id=id; fmap_insert(handles[0],id); return 0;
+}
+int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle) {
+    typedef int (*fn_t)(int,int,uint32_t*);
+    fn_t real=(fn_t)resolve_next("drmPrimeFDToHandle",(void*)drmPrimeFDToHandle);
+    if (!is_compositor() || is_gnome())
+        return real ? real(fd,prime_fd,handle) : -ENOSYS;
+    int r = real ? real(fd,prime_fd,handle) : -EACCES;
+    /* wlroots imports the gbm_bo's PRIME fd for scan-out, which needs DRM
+     * master -- the HWC2 composer owns it, so the real import returns EACCES.
+     * Use the prime fd itself as the GEM handle: gbm_hybris registered the
+     * prime_fd -> gralloc mapping (gmap) and find_gralloc()/find_by_fb() key on
+     * the prime fd, so AddFB2/commit can still recover the buffer. */
+    if (r != 0 && handle) { *handle = (uint32_t)prime_fd; r = 0; }
+    return r;
 }
 int drmModeRmFB(int fd, uint32_t id) {
     if (!is_compositor()) {
