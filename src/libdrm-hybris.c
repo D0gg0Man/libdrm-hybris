@@ -28,6 +28,9 @@
 #include <sys/ioctl.h>
 #include <stdarg.h>
 #include <poll.h>
+#include <sys/epoll.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <time.h>
 #include <android/android-config.h>
 #include <hybris/gralloc/gralloc.h>
@@ -423,6 +426,17 @@ static uint64_t g_last_flip_ns   = 0;
 static uint64_t g_deadline_ns    = 0;
 static uint32_t g_synth_seq      = 0;
 
+/* When the compositor nests the DRM fd inside an epoll instance and waits on
+ * that epoll fd from an outer poll/ppoll (phoc: wl_event_loop epoll fd polled
+ * by the GLib main loop), the outer wait must treat the epoll fd as a synth
+ * target too, then the epoll_wait hook injects the inner DRM readiness. */
+static int          g_epoll_fd = -1;
+static epoll_data_t g_drm_epoll_data;
+static int          g_drm_epoll_valid = 0;
+static int is_synth_fd(int fd) {
+    return fd == g_drm_fd || (g_drm_epoll_valid && fd == g_epoll_fd);
+}
+
 static ssize_t (*real_read)(int, void *, size_t) = NULL;
 static int     (*real_poll)(struct pollfd *, nfds_t, int) = NULL;
 static int     (*real_ppoll)(struct pollfd *, nfds_t, const struct timespec *, const sigset_t *) = NULL;
@@ -430,6 +444,11 @@ static int     (*real_ppoll)(struct pollfd *, nfds_t, const struct timespec *, c
 static uint64_t now_ns(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec;
+}
+static int g_stamp = -1;
+static void STAMP(const char *tag) {
+    if (g_stamp < 0) g_stamp = getenv("LIBDRM_HYBRIS_STAMP") ? 1 : 0;
+    if (g_stamp) fprintf(stderr, "STAMP %8.3f %s\n", (double)(now_ns() % 100000000000ull)/1e6, tag);
 }
 static void synth_note_flip(void) {
     uint64_t n = now_ns();
@@ -440,19 +459,29 @@ static void synth_note_flip(void) {
     }
     g_last_flip_ns = n;
 }
+/* Pace the synthetic flip completion at the panel's real vsync period (queried
+ * from HWC2, ~8.33ms at 120Hz). Delivering it immediately re-enters wlroots
+ * before its atomic-commit state settles and the loop stalls after a few
+ * frames; one vsync of delay mirrors real hardware and keeps it stable. The
+ * period is set once from drmadapter via drm_shim_set_vsync_period(); 8.33ms
+ * is only a startup fallback. */
+static uint64_t g_vsync_ns = 8333333ull;
+void drm_shim_set_vsync_period(uint64_t ns) {
+    if (ns > 1000000ull && ns < 100000000ull) g_vsync_ns = ns;
+}
 static void synth_arm(uint32_t crtc, uint64_t user_data) {
     g_synth_crtc = crtc;
     g_synth_user = user_data;
-    g_deadline_ns = now_ns() + (g_interval_ns ? g_interval_ns : 8333333ull);
+    g_deadline_ns = now_ns() + g_vsync_ns;
     g_synth_pending = 1;
     g_synth_active = 1;
+    STAMP("arm");
 }
 
 ssize_t read(int fd, void *buf, size_t count) {
     if (!real_read) real_read = (ssize_t(*)(int,void*,size_t))resolve_next("read",(void*)read);
     if (!g_synth_active || fd != g_drm_fd || !g_synth_pending || in_hook)
         return real_read(fd, buf, count);
-    if (now_ns() < g_deadline_ns) return real_read(fd, buf, count);
     if (count < sizeof(struct drm_event_vblank)) return real_read(fd, buf, count);
     struct drm_event_vblank ev; memset(&ev, 0, sizeof ev);
     ev.base.type   = DRM_EVENT_FLIP_COMPLETE;
@@ -465,19 +494,22 @@ ssize_t read(int fd, void *buf, size_t count) {
     ev.crtc_id  = g_synth_crtc;
     memcpy(buf, &ev, sizeof ev);
     g_synth_pending = 0;
+    STAMP("read-deliver");
     tracef("SYNTH read delivered crtc=%u user=0x%llx seq=%u\n", g_synth_crtc, (unsigned long long)g_synth_user, g_synth_seq);
     return sizeof ev;
 }
 static int synth_poll_fixup(struct pollfd *fds, nfds_t n, struct timespec *cap) {
+    (void)cap;
     if (!g_synth_active || !g_synth_pending) return -1;
-    int idx = -1;
+    /* A flip is pending: mark the (epoll-wrapped) DRM fd ready immediately so the
+     * compositor dispatches it on this very wakeup. Deadline-paced delivery
+     * raced the ppoll/epoll cycle and occasionally dropped a flip, leaving
+     * wlroots' frame_pending stuck and the whole repaint loop wedged. wlroots
+     * paces itself via its own render time + frame callbacks, so unconditional
+     * immediate completion is both simpler and reliable. */
     for (nfds_t i = 0; i < n; i++)
-        if (fds[i].fd == g_drm_fd && (fds[i].events & POLLIN)) { idx = (int)i; break; }
-    if (idx < 0) return -1;
-    int64_t rem = (int64_t)g_deadline_ns - (int64_t)now_ns();
-    if (rem <= 0) { fds[idx].revents |= POLLIN; return idx; }
-    if (cap) { cap->tv_sec = rem / 1000000000; cap->tv_nsec = rem % 1000000000; }
-    return -2;
+        if (is_synth_fd(fds[i].fd) && (fds[i].events & POLLIN)) { fds[i].revents |= POLLIN; return (int)i; }
+    return -1;
 }
 int poll(struct pollfd *fds, nfds_t n, int timeout) {
     if (!real_poll) real_poll = (int(*)(struct pollfd*,nfds_t,int))resolve_next("poll",(void*)poll);
@@ -489,7 +521,7 @@ int poll(struct pollfd *fds, nfds_t n, int timeout) {
     int got = real_poll(fds, n, timeout);
     if (got == 0 && g_synth_pending && now_ns() >= g_deadline_ns)
         for (nfds_t i = 0; i < n; i++)
-            if (fds[i].fd == g_drm_fd && (fds[i].events & POLLIN)) { fds[i].revents |= POLLIN; return 1; }
+            if (is_synth_fd(fds[i].fd) && (fds[i].events & POLLIN)) { fds[i].revents |= POLLIN; return 1; }
     return got;
 }
 int ppoll(struct pollfd *fds, nfds_t n, const struct timespec *to, const sigset_t *ss) {
@@ -504,8 +536,88 @@ int ppoll(struct pollfd *fds, nfds_t n, const struct timespec *to, const sigset_
     int got = real_ppoll(fds, n, eff, ss);
     if (got == 0 && g_synth_pending && now_ns() >= g_deadline_ns)
         for (nfds_t i = 0; i < n; i++)
-            if (fds[i].fd == g_drm_fd && (fds[i].events & POLLIN)) { fds[i].revents |= POLLIN; return 1; }
+            if (is_synth_fd(fds[i].fd) && (fds[i].events & POLLIN)) { fds[i].revents |= POLLIN; return 1; }
     return got;
+}
+
+/* epoll variants of the synth delivery, for compositors whose event loop waits
+ * on the DRM fd via epoll rather than poll/ppoll (wlroots/wayland uses epoll;
+ * mutter's GLib loop uses ppoll). We capture the epoll instance + the
+ * wl_event_source data the compositor associated with the DRM fd, then inject a
+ * readiness event when a synthetic flip is due. The compositor then read()s the
+ * fd and our read() hook hands back the DRM_EVENT_FLIP_COMPLETE. */
+static int (*real_epoll_ctl)(int,int,int,struct epoll_event*) = NULL;
+static int (*real_epoll_wait)(int,struct epoll_event*,int,int) = NULL;
+static int (*real_epoll_pwait)(int,struct epoll_event*,int,int,const sigset_t*) = NULL;
+
+static int fd_is_drm(int fd) {
+    struct stat st;
+    if (fstat(fd, &st) != 0) return 0;
+    return S_ISCHR(st.st_mode) && major(st.st_rdev) == 226; /* DRM major */
+}
+
+int epoll_ctl(int epfd, int op, int fd, struct epoll_event *ev) {
+    if (!real_epoll_ctl) real_epoll_ctl = (int(*)(int,int,int,struct epoll_event*))resolve_next("epoll_ctl",(void*)epoll_ctl);
+    int r = real_epoll_ctl(epfd, op, fd, ev);
+    if (is_compositor() && ev && (op == EPOLL_CTL_ADD || op == EPOLL_CTL_MOD) && fd_is_drm(fd)) {
+        g_epoll_fd = epfd; g_drm_epoll_data = ev->data; g_drm_epoll_valid = 1;
+        if (g_drm_fd < 0) g_drm_fd = fd;
+        if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+            fprintf(stderr, "libdrm-hybris: epoll_ctl tracked DRM fd=%d epfd=%d data=0x%llx\n",
+                    fd, epfd, (unsigned long long)ev->data.u64);
+    }
+    return r;
+}
+
+static unsigned long g_epoll_inject = 0;
+static int epoll_synth(int epfd, struct epoll_event *events, int n, int maxevents) {
+    if (n < 0) n = 0;
+    if (epfd != g_epoll_fd || !g_drm_epoll_valid || !g_synth_pending) return n;
+    g_epoll_inject++;
+    STAMP("epoll-inject");
+    for (int i = 0; i < n; i++)
+        if (events[i].data.u64 == g_drm_epoll_data.u64) { events[i].events |= EPOLLIN; return n; }
+    if (n < maxevents) {
+        events[n].events = EPOLLIN;
+        events[n].data   = g_drm_epoll_data;
+        return n + 1;
+    }
+    return n;
+}
+/* A pending flip must be delivered without blocking: don't let the compositor
+ * sleep in epoll_wait while we owe it a synthetic completion. */
+static int epoll_cap_timeout(int timeout) {
+    return g_synth_pending ? 0 : timeout;
+}
+
+int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout) {
+    if (!real_epoll_wait) real_epoll_wait = (int(*)(int,struct epoll_event*,int,int))resolve_next("epoll_wait",(void*)epoll_wait);
+    if (!g_synth_active || in_hook || epfd != g_epoll_fd || !g_drm_epoll_valid)
+        return real_epoll_wait(epfd, events, maxevents, timeout);
+    int n = real_epoll_wait(epfd, events, maxevents, epoll_cap_timeout(timeout));
+    return epoll_synth(epfd, events, n, maxevents);
+}
+int epoll_pwait(int epfd, struct epoll_event *events, int maxevents, int timeout, const sigset_t *ss) {
+    if (!real_epoll_pwait) real_epoll_pwait = (int(*)(int,struct epoll_event*,int,int,const sigset_t*))resolve_next("epoll_pwait",(void*)epoll_pwait);
+    if (!g_synth_active || in_hook || epfd != g_epoll_fd || !g_drm_epoll_valid)
+        return real_epoll_pwait(epfd, events, maxevents, timeout, ss);
+    int n = real_epoll_pwait(epfd, events, maxevents, epoll_cap_timeout(timeout), ss);
+    return epoll_synth(epfd, events, n, maxevents);
+}
+static int (*real_epoll_pwait2)(int,struct epoll_event*,int,const struct timespec*,const sigset_t*) = NULL;
+int epoll_pwait2(int epfd, struct epoll_event *events, int maxevents, const struct timespec *to, const sigset_t *ss) {
+    if (!real_epoll_pwait2) real_epoll_pwait2 = (int(*)(int,struct epoll_event*,int,const struct timespec*,const sigset_t*))resolve_next("epoll_pwait2",(void*)epoll_pwait2);
+    if (!g_synth_active || in_hook || epfd != g_epoll_fd || !g_drm_epoll_valid)
+        return real_epoll_pwait2(epfd, events, maxevents, to, ss);
+    struct timespec cap; const struct timespec *eff = to;
+    if (g_synth_pending) {
+        int64_t rem = (int64_t)g_deadline_ns - (int64_t)now_ns(); if (rem < 0) rem = 0;
+        cap.tv_sec = rem / 1000000000; cap.tv_nsec = rem % 1000000000;
+        uint64_t capn = (uint64_t)cap.tv_sec*1000000000ull + cap.tv_nsec;
+        if (!to || (uint64_t)to->tv_sec*1000000000ull + to->tv_nsec > capn) eff = &cap;
+    }
+    int n = real_epoll_pwait2(epfd, events, maxevents, eff, ss);
+    return epoll_synth(epfd, events, n, maxevents);
 }
 
 static int gmap_evict = 0;
@@ -534,6 +646,43 @@ static buffer_handle_t find_by_fb(uint32_t fb_id) {
 buffer_handle_t drm_shim_lookup_gralloc(uint32_t fd) {
     return find_gralloc(fd);
 }
+
+/* Present a wlroots-rendered gralloc buffer to HWC2. wlroots has no drmadapter
+ * EGL window surface, so drmadapter's present_cb (which mutter's eglSwapBuffers
+ * drives) never runs and the faked KMS commit alone wouldn't reach the panel.
+ * Hand the committed buffer to libhybris, which presents the matching
+ * RemoteWindowBuffer via drmadapter's HWC2 display/layer. Only under
+ * HYBRIS_WLROOTS; the mutter path presents itself. */
+static int g_wlroots = -1;
+/* The drmadapter EGL platform registers its HWC2 present callback here at init.
+ * It lives in a ws module dlopen()'d RTLD_LAZY (local scope), so it can't be
+ * reached by dlsym from here -- but this shim is globally preloaded, so the
+ * registration goes the other way (drmadapter -> us). */
+static int (*g_present_fn)(buffer_handle_t) = NULL;
+void drm_shim_set_present(int (*fn)(buffer_handle_t)) {
+    g_present_fn = fn;
+    if (getenv("LIBDRM_HYBRIS_SAMPLE")) fprintf(stderr, "libdrm-hybris: present callback registered fn=%p\n", (void*)fn);
+}
+static void present_hwc2(buffer_handle_t h) {
+    if (g_wlroots < 0) g_wlroots = getenv("HYBRIS_WLROOTS") ? 1 : 0;
+    if (!g_wlroots || !h || !g_present_fn) return;
+    /* wlroots renders the output via an FBO over an EGLImage of the gralloc
+     * buffer and signals a GPU fence, expecting KMS to wait on IN_FENCE_FD
+     * before scan-out. We fake the commit and can't honour that fence, so force
+     * the GPU to finish resolving into the buffer before we hand it to HWC2 --
+     * otherwise the panel scans out a stale (black) buffer. */
+    static void (*gl_finish)(void) = NULL;
+    static int gf_resolved = 0;
+    if (!gf_resolved) { gl_finish = (void(*)(void))dlsym(RTLD_DEFAULT, "glFinish"); gf_resolved = 1; }
+    STAMP("present:pre-glFinish");
+    if (gl_finish) gl_finish();
+    STAMP("present:post-glFinish");
+    int rc = g_present_fn(h);
+    STAMP("present:post-hwc2");
+    static int logged = 0;
+    if (!logged && getenv("LIBDRM_HYBRIS_SAMPLE")) { fprintf(stderr, "libdrm-hybris: first present_hwc2(h=%p) rc=%d\n", (void*)h, rc); logged = 1; }
+    (void)rc;
+}
 static int fmap_evict = 0;
 static void fmap_insert(uint32_t gem, uint32_t fb_id) {
     for (int i = 0; i < fmap_n; i++)
@@ -549,6 +698,26 @@ static void fmap_insert(uint32_t gem, uint32_t fb_id) {
  * makes gnome-session stop the shell after ~43s (verified on-device). The lock/
  * unlock is evidently a GPU/cache sync the HWC2 presentation relies on, so keep
  * it. (The dumb FB also gives mutter a real FB id to page-flip to.) */
+static unsigned long g_commit_n = 0;
+/* Diagnostic: scan every registered gralloc buffer for non-black content, to
+ * tell whether the rendered frame landed in a buffer we simply didn't pick. */
+static void sample_all_buffers(void) {
+    if (!frame_w || !frame_h) return;
+    for (int i = 0; i < gmap_n; i++) {
+        buffer_handle_t h = gmap[i].gralloc;
+        if (!h) continue;
+        void *s = NULL;
+        if (hybris_gralloc_lock(h, 0x3, 0, 0, frame_w, frame_h, &s) || !s) continue;
+        unsigned long nz = 0;
+        for (uint32_t y = 0; y < frame_h; y += 64)
+            for (uint32_t x = 0; x < frame_w; x += 64) {
+                uint8_t *p = (uint8_t*)s + (size_t)y*frame_w*4 + x*4;
+                if (p[0]|p[1]|p[2]) nz++;
+            }
+        hybris_gralloc_unlock(h);
+        if (nz) fprintf(stderr, "libdrm-hybris:   buffer[%d] gralloc=%p NONBLACK samples=%lu\n", i, (void*)h, nz);
+    }
+}
 static void copy_to_dumb(buffer_handle_t h) {
     if (!dumb_map || !h || !frame_w || !frame_h) return;
     void *src = NULL;
@@ -556,6 +725,18 @@ static void copy_to_dumb(buffer_handle_t h) {
     uint8_t *d = dumb_map, *s = src;
     for (uint32_t y = 0; y < frame_h; y++)
         memcpy(d + y*dumb_pitch, s + y*dumb_pitch, frame_w*4);
+    /* Diagnostic: is the committed buffer actually non-black? Sample a grid. */
+    if (getenv("LIBDRM_HYBRIS_SAMPLE")) {
+        unsigned long nz = 0; uint32_t cx = frame_w/2, cy = frame_h/2;
+        for (uint32_t y = 0; y < frame_h; y += 64)
+            for (uint32_t x = 0; x < frame_w; x += 64) {
+                uint8_t *p = s + y*dumb_pitch + x*4;
+                if (p[0]|p[1]|p[2]) nz++;
+            }
+        uint8_t *c = s + cy*dumb_pitch + cx*4;
+        fprintf(stderr, "libdrm-hybris: commit#%lu h=%p nonblack_samples=%lu center=%02x%02x%02x\n",
+                g_commit_n, (void*)h, nz, c[0], c[1], c[2]);
+    }
     hybris_gralloc_unlock(h);
 }
 static int init_dumb(int fd) {
@@ -650,7 +831,7 @@ int drmModePageFlip(int fd, uint32_t crtc_id, uint32_t fb_id, uint32_t flags, vo
     if (!is_compositor())
         return real ? real(fd,crtc_id,fb_id,flags,ud) : -ENOSYS;
     g_drm_fd = fd; synth_note_flip();
-    buffer_handle_t h=find_by_fb(fb_id); copy_to_dumb(h);
+    buffer_handle_t h=find_by_fb(fb_id); copy_to_dumb(h); present_hwc2(h);
     int r = real ? real(fd,crtc_id,dumb_fb_id?dumb_fb_id:fb_id,flags,ud) : 0;
     if (r == -EACCES) {
         if (flags & DRM_MODE_PAGE_FLIP_EVENT)
@@ -659,16 +840,97 @@ int drmModePageFlip(int fd, uint32_t crtc_id, uint32_t fb_id, uint32_t flags, vo
     }
     return r;
 }
+/* The synthetic flip event must carry the real CRTC id: wlroots' version-3
+ * page_flip_handler2 matches the event to a connector by crtc_id
+ * (drm_page_flip_pop), and drops it otherwise -> the repaint loop never
+ * advances. Discover it from the connected connector's encoder (the HWC2
+ * composer already has the panel lit, so the kernel reports a live CRTC). */
+static uint32_t g_crtc_id = 0;
+static uint32_t discover_crtc(int fd) {
+    if (g_crtc_id) return g_crtc_id;
+    int saved = in_hook; in_hook = 1;
+    drmModeRes *res = drmModeGetResources(fd);
+    if (res) {
+        for (int i = 0; i < res->count_connectors && !g_crtc_id; i++) {
+            drmModeConnector *c = drmModeGetConnector(fd, res->connectors[i]);
+            if (c && c->connection == DRM_MODE_CONNECTED && c->encoder_id) {
+                drmModeEncoder *e = drmModeGetEncoder(fd, c->encoder_id);
+                if (e && e->crtc_id) g_crtc_id = e->crtc_id;
+                if (e) drmModeFreeEncoder(e);
+            }
+            if (c) drmModeFreeConnector(c);
+        }
+        if (!g_crtc_id && res->count_crtcs > 0) g_crtc_id = res->crtcs[0];
+        drmModeFreeResources(res);
+    }
+    in_hook = saved;
+    if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+        fprintf(stderr, "libdrm-hybris: discovered CRTC id=%u\n", g_crtc_id);
+    return g_crtc_id;
+}
+
+/* The atomic request can reference several framebuffers (one per swapchain
+ * buffer queued over time); only the FB_ID set on the primary plane in *this*
+ * commit is the frame being scanned out. Guessing the most-recent AddFB2 picks
+ * the wrong (un-rendered) buffer. Capture the real FB_ID by intercepting the
+ * property the compositor sets on the plane. */
+static uint32_t g_fbid_prop = 0, g_crtcid_prop = 0;
+static uint32_t g_committed_fb = 0, g_committed_crtc = 0;
+int drmModeAtomicAddProperty(drmModeAtomicReqPtr req, uint32_t obj, uint32_t prop, uint64_t val) {
+    typedef int (*fn_t)(drmModeAtomicReqPtr,uint32_t,uint32_t,uint64_t);
+    fn_t real = (fn_t)resolve_next("drmModeAtomicAddProperty",(void*)drmModeAtomicAddProperty);
+    if (is_compositor() && g_drm_fd >= 0 && !in_hook) {
+        if ((!g_fbid_prop || !g_crtcid_prop)) { /* learn FB_ID / CRTC_ID prop ids (device-global) */
+            in_hook = 1;
+            drmModePropertyPtr p = drmModeGetProperty(g_drm_fd, prop);
+            if (p) {
+                if (strcmp(p->name, "FB_ID") == 0) g_fbid_prop = prop;
+                else if (strcmp(p->name, "CRTC_ID") == 0) g_crtcid_prop = prop;
+                drmModeFreeProperty(p);
+            }
+            in_hook = 0;
+        }
+        if (prop == g_fbid_prop && val) g_committed_fb = (uint32_t)val;
+        /* The CRTC the compositor actually drives this connector with -- the
+         * synthetic flip event must carry exactly this id or wlroots'
+         * handle_page_flip drops it (no buffer release, no next frame). */
+        if (prop == g_crtcid_prop && val) g_committed_crtc = (uint32_t)val;
+    }
+    return real ? real(req, obj, prop, val) : -ENOSYS;
+}
+
 int drmModeAtomicCommit(int fd, drmModeAtomicReqPtr req, uint32_t flags, void *ud) {
     if (!is_compositor()) {
         typedef int (*fn_t)(int,drmModeAtomicReqPtr,uint32_t,void*);
         fn_t real=(fn_t)resolve_next("drmModeAtomicCommit",(void*)drmModeAtomicCommit);
         return real ? real(fd,req,flags,ud) : -ENOSYS;
     }
-    for (int i=fmap_n-1; i>=0; i--) {
-        buffer_handle_t h=find_gralloc(fmap[i].gem);
-        if (h) { copy_to_dumb(h); break; }
+    /* Atomic check (TEST_ONLY): just report the config valid, present nothing. */
+    if (flags & DRM_MODE_ATOMIC_TEST_ONLY) return 0;
+    g_drm_fd = fd; synth_note_flip();
+    g_commit_n++;
+    STAMP("commit");
+    /* Present the framebuffer this commit actually scans out (captured from the
+     * plane's FB_ID property); fall back to the most-recent FB only if unknown. */
+    buffer_handle_t h = g_committed_fb ? find_by_fb(g_committed_fb) : NULL;
+    if (!h) for (int i=fmap_n-1; i>=0; i--) { h=find_gralloc(fmap[i].gem); if (h) break; }
+    if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+        fprintf(stderr, "libdrm-hybris: atomicCommit #%lu flags=0x%x fb=%u h=%p arm=%d\n",
+                g_commit_n, flags, g_committed_fb, (void*)h, (flags & DRM_MODE_PAGE_FLIP_EVENT)?1:0);
+    if (h) { copy_to_dumb(h); present_hwc2(h); }
+    g_committed_fb = 0;
+    /* wlroots commits non-blocking and waits for a page-flip completion event
+     * before scheduling the next frame. The HWC2 composer owns the CRTC so no
+     * real event arrives -- synthesize one (carrying wlroots' user_data) or the
+     * repaint loop stalls after a single frame. */
+    if (flags & DRM_MODE_PAGE_FLIP_EVENT) {
+        uint32_t crtc = g_committed_crtc ? g_committed_crtc : discover_crtc(fd);
+        if (getenv("LIBDRM_HYBRIS_SAMPLE") && g_commit_n <= 3)
+            fprintf(stderr, "libdrm-hybris: synth crtc=%u (committed=%u discovered=%u)\n",
+                    crtc, g_committed_crtc, discover_crtc(fd));
+        synth_arm(crtc, (uint64_t)(uintptr_t)ud);
     }
+    if (getenv("LIBDRM_HYBRIS_SAMPLE")) sample_all_buffers();
     return 0;
 }
 
@@ -695,7 +957,7 @@ int ioctl(int fd, unsigned long request, ...) {
     } else if (nr==0xb0||nr==0xb6) {
         struct drm_mode_crtc_page_flip *flip=arg;
         g_drm_fd=fd; synth_note_flip();
-        buffer_handle_t h=find_by_fb(flip->fb_id); copy_to_dumb(h);
+        buffer_handle_t h=find_by_fb(flip->fb_id); copy_to_dumb(h); present_hwc2(h);
         if (dumb_fb_id) flip->fb_id=dumb_fb_id;
         ret=real_ioctl(fd,request,arg);
         if (ret!=0 && errno==EACCES) {
@@ -706,7 +968,7 @@ int ioctl(int fd, unsigned long request, ...) {
     } else if (nr==0xbc) {
         for (int i=fmap_n-1; i>=0; i--) {
             buffer_handle_t h=find_gralloc(fmap[i].gem);
-            if (h) { copy_to_dumb(h); break; }
+            if (h) { copy_to_dumb(h); present_hwc2(h); break; }
         }
         ret=0;
     } else if (nr==0x11) { ret=0;
