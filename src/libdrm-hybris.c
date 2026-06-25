@@ -527,6 +527,13 @@ static buffer_handle_t find_by_fb(uint32_t fb_id) {
         if (fmap[i].fb_id == fb_id) return find_gralloc(fmap[i].gem);
     return NULL;
 }
+/* Exported so libhybris (eglplatformcommon) can recover the gralloc handle
+ * behind a gbm_hybris dmabuf fd when wlroots imports it as an EGL image --
+ * the Mali EGL imports gralloc ANativeWindowBuffers, not generic Linux
+ * dmabufs, so the dmabuf import has to be bridged to a native-buffer import. */
+buffer_handle_t drm_shim_lookup_gralloc(uint32_t fd) {
+    return find_gralloc(fd);
+}
 static int fmap_evict = 0;
 static void fmap_insert(uint32_t gem, uint32_t fb_id) {
     for (int i = 0; i < fmap_n; i++)
