@@ -501,12 +501,6 @@ ssize_t read(int fd, void *buf, size_t count) {
 static int synth_poll_fixup(struct pollfd *fds, nfds_t n, struct timespec *cap) {
     (void)cap;
     if (!g_synth_active || !g_synth_pending) return -1;
-    /* A flip is pending: mark the (epoll-wrapped) DRM fd ready immediately so the
-     * compositor dispatches it on this very wakeup. Deadline-paced delivery
-     * raced the ppoll/epoll cycle and occasionally dropped a flip, leaving
-     * wlroots' frame_pending stuck and the whole repaint loop wedged. wlroots
-     * paces itself via its own render time + frame callbacks, so unconditional
-     * immediate completion is both simpler and reliable. */
     for (nfds_t i = 0; i < n; i++)
         if (is_synth_fd(fds[i].fd) && (fds[i].events & POLLIN)) { fds[i].revents |= POLLIN; return (int)i; }
     return -1;
@@ -584,8 +578,7 @@ static int epoll_synth(int epfd, struct epoll_event *events, int n, int maxevent
     }
     return n;
 }
-/* A pending flip must be delivered without blocking: don't let the compositor
- * sleep in epoll_wait while we owe it a synthetic completion. */
+/* A pending flip must be delivered without blocking. */
 static int epoll_cap_timeout(int timeout) {
     return g_synth_pending ? 0 : timeout;
 }
@@ -663,24 +656,32 @@ void drm_shim_set_present(int (*fn)(buffer_handle_t)) {
     g_present_fn = fn;
     if (getenv("LIBDRM_HYBRIS_SAMPLE")) fprintf(stderr, "libdrm-hybris: present callback registered fn=%p\n", (void*)fn);
 }
+/* wlroots' render-completion fence for the current commit (the plane's
+ * IN_FENCE_FD). We fake the KMS commit, so the kernel never waits on it -- we
+ * must, or the blit/HWC2 scans out a half-rendered (flickery/black) buffer.
+ * Captured in drmModeAtomicAddProperty; consumed (waited + closed) here. */
+static int g_committed_fence = -1;
 static void present_hwc2(buffer_handle_t h) {
     if (g_wlroots < 0) g_wlroots = getenv("HYBRIS_WLROOTS") ? 1 : 0;
-    if (!g_wlroots || !h || !g_present_fn) return;
-    /* wlroots renders the output via an FBO over an EGLImage of the gralloc
-     * buffer and signals a GPU fence, expecting KMS to wait on IN_FENCE_FD
-     * before scan-out. We fake the commit and can't honour that fence, so force
-     * the GPU to finish resolving into the buffer before we hand it to HWC2 --
-     * otherwise the panel scans out a stale (black) buffer. */
-    static void (*gl_finish)(void) = NULL;
-    static int gf_resolved = 0;
-    if (!gf_resolved) { gl_finish = (void(*)(void))dlsym(RTLD_DEFAULT, "glFinish"); gf_resolved = 1; }
-    STAMP("present:pre-glFinish");
-    if (gl_finish) gl_finish();
-    STAMP("present:post-glFinish");
+    if (!g_wlroots || !h || !g_present_fn) {
+        if (g_committed_fence >= 0) { close(g_committed_fence); g_committed_fence = -1; }
+        return;
+    }
+    /* Block until wlroots' GPU render into this buffer is complete. The sync
+     * file becomes readable (POLLIN) when signalled; act as the kernel that
+     * consumes the in-fence. */
+    if (g_committed_fence >= 0) {
+        struct pollfd pfd = { .fd = g_committed_fence, .events = POLLIN };
+        int saved = in_hook; in_hook = 1;
+        real_poll ? real_poll(&pfd, 1, 1000) : poll(&pfd, 1, 1000);
+        in_hook = saved;
+        static int logged = 0;
+        if (!logged && getenv("LIBDRM_HYBRIS_SAMPLE")) { fprintf(stderr, "libdrm-hybris: waited on IN_FENCE_FD %d\n", g_committed_fence); logged = 1; }
+        close(g_committed_fence); g_committed_fence = -1;
+    }
     int rc = g_present_fn(h);
-    STAMP("present:post-hwc2");
-    static int logged = 0;
-    if (!logged && getenv("LIBDRM_HYBRIS_SAMPLE")) { fprintf(stderr, "libdrm-hybris: first present_hwc2(h=%p) rc=%d\n", (void*)h, rc); logged = 1; }
+    static int logged2 = 0;
+    if (!logged2 && getenv("LIBDRM_HYBRIS_SAMPLE")) { fprintf(stderr, "libdrm-hybris: first present_hwc2(h=%p) rc=%d\n", (void*)h, rc); logged2 = 1; }
     (void)rc;
 }
 static int fmap_evict = 0;
@@ -723,6 +724,15 @@ static void copy_to_dumb(buffer_handle_t h) {
     void *src = NULL;
     if (hybris_gralloc_lock(h, 0x3|0x30, 0, 0, frame_w, frame_h, &src) || !src) return;
     uint8_t *d = dumb_map, *s = src;
+    /* Diagnostic: overwrite the committed buffer with solid red just before it
+     * is presented, to test whether the HWC2 present path reaches the panel at
+     * all (independent of what the client rendered). */
+    if (getenv("LIBDRM_HYBRIS_REDTEST")) {
+        for (uint32_t y = 0; y < frame_h; y++) {
+            uint32_t *row = (uint32_t *)(s + y*dumb_pitch);
+            for (uint32_t x = 0; x < frame_w; x++) row[x] = 0x00FF0000; /* XRGB red */
+        }
+    }
     for (uint32_t y = 0; y < frame_h; y++)
         memcpy(d + y*dumb_pitch, s + y*dumb_pitch, frame_w*4);
     /* Diagnostic: is the committed buffer actually non-black? Sample a grid. */
@@ -874,18 +884,20 @@ static uint32_t discover_crtc(int fd) {
  * commit is the frame being scanned out. Guessing the most-recent AddFB2 picks
  * the wrong (un-rendered) buffer. Capture the real FB_ID by intercepting the
  * property the compositor sets on the plane. */
-static uint32_t g_fbid_prop = 0, g_crtcid_prop = 0;
+static uint32_t g_fbid_prop = 0, g_crtcid_prop = 0, g_infence_prop = 0;
+static int g_infence_learned = 0;
 static uint32_t g_committed_fb = 0, g_committed_crtc = 0;
 int drmModeAtomicAddProperty(drmModeAtomicReqPtr req, uint32_t obj, uint32_t prop, uint64_t val) {
     typedef int (*fn_t)(drmModeAtomicReqPtr,uint32_t,uint32_t,uint64_t);
     fn_t real = (fn_t)resolve_next("drmModeAtomicAddProperty",(void*)drmModeAtomicAddProperty);
     if (is_compositor() && g_drm_fd >= 0 && !in_hook) {
-        if ((!g_fbid_prop || !g_crtcid_prop)) { /* learn FB_ID / CRTC_ID prop ids (device-global) */
+        if (!g_fbid_prop || !g_crtcid_prop || !g_infence_learned) { /* learn prop ids (device-global) */
             in_hook = 1;
             drmModePropertyPtr p = drmModeGetProperty(g_drm_fd, prop);
             if (p) {
                 if (strcmp(p->name, "FB_ID") == 0) g_fbid_prop = prop;
                 else if (strcmp(p->name, "CRTC_ID") == 0) g_crtcid_prop = prop;
+                else if (strcmp(p->name, "IN_FENCE_FD") == 0) { g_infence_prop = prop; g_infence_learned = 1; }
                 drmModeFreeProperty(p);
             }
             in_hook = 0;
@@ -895,6 +907,10 @@ int drmModeAtomicAddProperty(drmModeAtomicReqPtr req, uint32_t obj, uint32_t pro
          * synthetic flip event must carry exactly this id or wlroots'
          * handle_page_flip drops it (no buffer release, no next frame). */
         if (prop == g_crtcid_prop && val) g_committed_crtc = (uint32_t)val;
+        /* wlroots' render-completion fence for this frame; present_hwc2 waits on
+         * it (then closes it) before the buffer is sampled/scanned out. */
+        if (g_infence_prop && prop == g_infence_prop && (int64_t)val >= 0)
+            g_committed_fence = (int)val;
     }
     return real ? real(req, obj, prop, val) : -ENOSYS;
 }
