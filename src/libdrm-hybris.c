@@ -724,15 +724,8 @@ static void copy_to_dumb(buffer_handle_t h) {
     void *src = NULL;
     if (hybris_gralloc_lock(h, 0x3|0x30, 0, 0, frame_w, frame_h, &src) || !src) return;
     uint8_t *d = dumb_map, *s = src;
-    /* Diagnostic: overwrite the committed buffer with solid red just before it
-     * is presented, to test whether the HWC2 present path reaches the panel at
-     * all (independent of what the client rendered). */
-    if (getenv("LIBDRM_HYBRIS_REDTEST")) {
-        for (uint32_t y = 0; y < frame_h; y++) {
-            uint32_t *row = (uint32_t *)(s + y*dumb_pitch);
-            for (uint32_t x = 0; x < frame_w; x++) row[x] = 0x00FF0000; /* XRGB red */
-        }
-    }
+    /* The full-frame read here is load-bearing: touching every pixel forces the
+     * Mali GPU to resolve its render into the buffer before it's presented. */
     for (uint32_t y = 0; y < frame_h; y++)
         memcpy(d + y*dumb_pitch, s + y*dumb_pitch, frame_w*4);
     /* Diagnostic: is the committed buffer actually non-black? Sample a grid. */
