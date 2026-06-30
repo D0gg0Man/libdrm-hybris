@@ -896,6 +896,25 @@ static uint32_t g_committed_fb = 0, g_committed_crtc = 0;
 static uint32_t g_active_prop = 0;
 static int g_pending_active = -1;   /* ACTIVE value seen in the current commit, -1 if none */
 static int g_output_on = 1;          /* current panel power state (init: on) */
+
+/* phoc calls this directly (dlsym) from its output-power-management handler to
+ * power the panel off/on WITHOUT disabling the wlroots output. Disabling the
+ * output tears down the mode and triggers a modeset on re-enable, after which
+ * wlroots stops scheduling frames for client damage on this faked-KMS backend
+ * (the screen freezes). Keeping the output enabled and only toggling HWC2 panel
+ * power avoids the modeset entirely. */
+void drm_shim_panel_power(int on) {
+    on = on ? 1 : 0;
+    if (on == g_output_on) return;
+    g_output_on = on;
+    if (g_power_fn) g_power_fn(on);
+    if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+        fprintf(stderr, "libdrm-hybris: drm_shim_panel_power -> %s\n", on ? "ON" : "OFF");
+}
+/* phoc queries this on input activity: if the panel was blanked, phoc forces it
+ * back on (and repaints), so ANY input wakes the screen even when phosh's
+ * lockscreen/idle manager does not request the wake itself. */
+int drm_shim_panel_is_on(void) { return g_output_on; }
 int drmModeAtomicAddProperty(drmModeAtomicReqPtr req, uint32_t obj, uint32_t prop, uint64_t val) {
     typedef int (*fn_t)(drmModeAtomicReqPtr,uint32_t,uint32_t,uint64_t);
     fn_t real = (fn_t)resolve_next("drmModeAtomicAddProperty",(void*)drmModeAtomicAddProperty);
@@ -945,16 +964,12 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReqPtr req, uint32_t flags, void *u
     if (getenv("LIBDRM_HYBRIS_SAMPLE"))
         fprintf(stderr, "libdrm-hybris: atomicCommit #%lu flags=0x%x fb=%u h=%p arm=%d\n",
                 g_commit_n, flags, g_committed_fb, (void*)h, (flags & DRM_MODE_PAGE_FLIP_EVENT)?1:0);
-    /* DPMS: when wlroots toggles CRTC ACTIVE, drive the real panel power. Do the
-     * power-on BEFORE presenting this commit's frame (the re-enable commit also
-     * carries the first wake frame). */
-    if (g_pending_active >= 0 && g_pending_active != g_output_on) {
-        g_output_on = g_pending_active;
-        if (g_power_fn) g_power_fn(g_output_on);
-        if (getenv("LIBDRM_HYBRIS_SAMPLE"))
-            fprintf(stderr, "libdrm-hybris: panel power -> %s (commit #%lu)\n",
-                    g_output_on ? "ON" : "OFF", g_commit_n);
-    }
+    /* DPMS is driven by phoc's output-power handler via drm_shim_panel_power()
+     * (which keeps the wlr output enabled -> no modeset -> no freeze). We do NOT
+     * also toggle power from the CRTC ACTIVE property here: with the output kept
+     * enabled, ACTIVE stays 1 every commit and would immediately undo a
+     * panel-off, oscillating the backlight. (g_pending_active is left tracked
+     * but unused as a harmless fallback hook.) */
     g_pending_active = -1;
     if (h) { copy_to_dumb(h); present_hwc2(h); }
     g_committed_fb = 0;
