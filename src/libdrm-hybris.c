@@ -656,6 +656,18 @@ void drm_shim_set_present(int (*fn)(buffer_handle_t)) {
     g_present_fn = fn;
     if (getenv("LIBDRM_HYBRIS_SAMPLE")) fprintf(stderr, "libdrm-hybris: present callback registered fn=%p\n", (void*)fn);
 }
+/* drmadapter also registers a power callback so we can drive the real HWC2
+ * display power off/on when wlroots toggles the CRTC ACTIVE state (DPMS). The
+ * faked atomic commit otherwise never touches the panel power: "blanking" just
+ * stops phoc presenting (backlight stays on showing the last frame) and wake
+ * never powers anything back -- so the screen looks frozen. With this, an
+ * output-disable commit powers the panel down and the re-enable commit (driven
+ * by phosh on wake input) powers it back up. */
+static void (*g_power_fn)(int) = NULL;
+void drm_shim_set_power(void (*fn)(int)) {
+    g_power_fn = fn;
+    if (getenv("LIBDRM_HYBRIS_SAMPLE")) fprintf(stderr, "libdrm-hybris: power callback registered fn=%p\n", (void*)fn);
+}
 /* wlroots' render-completion fence for the current commit (the plane's
  * IN_FENCE_FD). We fake the KMS commit, so the kernel never waits on it -- we
  * must, or the blit/HWC2 scans out a half-rendered (flickery/black) buffer.
@@ -880,22 +892,29 @@ static uint32_t discover_crtc(int fd) {
 static uint32_t g_fbid_prop = 0, g_crtcid_prop = 0, g_infence_prop = 0;
 static int g_infence_learned = 0;
 static uint32_t g_committed_fb = 0, g_committed_crtc = 0;
+/* CRTC ACTIVE property -> drives DPMS (panel power) via g_power_fn. */
+static uint32_t g_active_prop = 0;
+static int g_pending_active = -1;   /* ACTIVE value seen in the current commit, -1 if none */
+static int g_output_on = 1;          /* current panel power state (init: on) */
 int drmModeAtomicAddProperty(drmModeAtomicReqPtr req, uint32_t obj, uint32_t prop, uint64_t val) {
     typedef int (*fn_t)(drmModeAtomicReqPtr,uint32_t,uint32_t,uint64_t);
     fn_t real = (fn_t)resolve_next("drmModeAtomicAddProperty",(void*)drmModeAtomicAddProperty);
     if (is_compositor() && g_drm_fd >= 0 && !in_hook) {
-        if (!g_fbid_prop || !g_crtcid_prop || !g_infence_learned) { /* learn prop ids (device-global) */
+        if (!g_fbid_prop || !g_crtcid_prop || !g_infence_learned || !g_active_prop) { /* learn prop ids (device-global) */
             in_hook = 1;
             drmModePropertyPtr p = drmModeGetProperty(g_drm_fd, prop);
             if (p) {
                 if (strcmp(p->name, "FB_ID") == 0) g_fbid_prop = prop;
                 else if (strcmp(p->name, "CRTC_ID") == 0) g_crtcid_prop = prop;
                 else if (strcmp(p->name, "IN_FENCE_FD") == 0) { g_infence_prop = prop; g_infence_learned = 1; }
+                else if (strcmp(p->name, "ACTIVE") == 0) g_active_prop = prop;
                 drmModeFreeProperty(p);
             }
             in_hook = 0;
         }
         if (prop == g_fbid_prop && val) g_committed_fb = (uint32_t)val;
+        /* CRTC ACTIVE=0 disables the output (DPMS off), =1 re-enables it. */
+        if (g_active_prop && prop == g_active_prop) g_pending_active = (int)val;
         /* The CRTC the compositor actually drives this connector with -- the
          * synthetic flip event must carry exactly this id or wlroots'
          * handle_page_flip drops it (no buffer release, no next frame). */
@@ -926,6 +945,17 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReqPtr req, uint32_t flags, void *u
     if (getenv("LIBDRM_HYBRIS_SAMPLE"))
         fprintf(stderr, "libdrm-hybris: atomicCommit #%lu flags=0x%x fb=%u h=%p arm=%d\n",
                 g_commit_n, flags, g_committed_fb, (void*)h, (flags & DRM_MODE_PAGE_FLIP_EVENT)?1:0);
+    /* DPMS: when wlroots toggles CRTC ACTIVE, drive the real panel power. Do the
+     * power-on BEFORE presenting this commit's frame (the re-enable commit also
+     * carries the first wake frame). */
+    if (g_pending_active >= 0 && g_pending_active != g_output_on) {
+        g_output_on = g_pending_active;
+        if (g_power_fn) g_power_fn(g_output_on);
+        if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+            fprintf(stderr, "libdrm-hybris: panel power -> %s (commit #%lu)\n",
+                    g_output_on ? "ON" : "OFF", g_commit_n);
+    }
+    g_pending_active = -1;
     if (h) { copy_to_dumb(h); present_hwc2(h); }
     g_committed_fb = 0;
     /* wlroots commits non-blocking and waits for a page-flip completion event
