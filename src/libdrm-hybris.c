@@ -561,8 +561,7 @@ ssize_t read(int fd, void *buf, size_t count) {
            ev.crtc_id, (unsigned long long)ev.user_data, g_synth_seq, g_synth_qn);
     return sizeof ev;
 }
-static int synth_poll_fixup(struct pollfd *fds, nfds_t n, struct timespec *cap) {
-    (void)cap;
+static int synth_poll_fixup(struct pollfd *fds, nfds_t n) {
     if (!g_synth_active || g_synth_qn <= 0) return -1;
     if (now_ns() < g_synth_q[g_synth_qh].deadline) return -1; /* not due yet */
     for (nfds_t i = 0; i < n; i++)
@@ -572,10 +571,7 @@ static int synth_poll_fixup(struct pollfd *fds, nfds_t n, struct timespec *cap) 
 int poll(struct pollfd *fds, nfds_t n, int timeout) {
     if (!real_poll) real_poll = (int(*)(struct pollfd*,nfds_t,int))resolve_next("poll",(void*)poll);
     if (!g_synth_active || in_hook) return real_poll(fds, n, timeout);
-    struct timespec cap;
-    int r = synth_poll_fixup(fds, n, &cap);
-    if (r >= 0) return 1;
-    if (r == -2) { int ms = (int)((cap.tv_sec*1000000000ll+cap.tv_nsec)/1000000)+1; if (timeout < 0 || timeout > ms) timeout = ms; }
+    if (synth_poll_fixup(fds, n) >= 0) return 1;
     int got = real_poll(fds, n, timeout);
     if (got == 0 && g_synth_qn > 0 && now_ns() >= g_synth_q[g_synth_qh].deadline)
         for (nfds_t i = 0; i < n; i++)
@@ -585,13 +581,8 @@ int poll(struct pollfd *fds, nfds_t n, int timeout) {
 int ppoll(struct pollfd *fds, nfds_t n, const struct timespec *to, const sigset_t *ss) {
     if (!real_ppoll) real_ppoll = (int(*)(struct pollfd*,nfds_t,const struct timespec*,const sigset_t*))resolve_next("ppoll",(void*)ppoll);
     if (!g_synth_active || in_hook) return real_ppoll(fds, n, to, ss);
-    struct timespec cap;
-    int r = synth_poll_fixup(fds, n, &cap);
-    if (r >= 0) return 1;
-    const struct timespec *eff = to;
-    if (r == -2 && (!to || (uint64_t)to->tv_sec*1000000000ull+to->tv_nsec > (uint64_t)cap.tv_sec*1000000000ull+cap.tv_nsec))
-        eff = &cap;
-    int got = real_ppoll(fds, n, eff, ss);
+    if (synth_poll_fixup(fds, n) >= 0) return 1;
+    int got = real_ppoll(fds, n, to, ss);
     if (got == 0 && g_synth_qn > 0 && now_ns() >= g_synth_q[g_synth_qh].deadline)
         for (nfds_t i = 0; i < n; i++)
             if (is_synth_fd(fds[i].fd) && (fds[i].events & POLLIN)) { fds[i].revents |= POLLIN; return 1; }
