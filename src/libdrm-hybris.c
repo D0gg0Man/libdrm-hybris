@@ -1082,7 +1082,16 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReqPtr req, uint32_t flags, void *u
          * a session's buffers are AFBC or linear decides blank/flicker/clean).
          * Keep it only if LIBDRM_HYBRIS_DUMBCOPY=1. */
         static int dc = -1;
-        if (dc < 0) { const char *e = getenv("LIBDRM_HYBRIS_DUMBCOPY"); dc = (e && *e == '1') ? 1 : 0; }
+        if (dc < 0) {
+            const char *e = getenv("LIBDRM_HYBRIS_DUMBCOPY");
+            /* Default ON for the gnome/mutter session: the per-frame CPU read
+             * is load-bearing there (without it gnome-session stops the shell
+             * after ~43s). The wlroots/phoc session presents via its own CPU
+             * copy and must NOT also do this (the write-usage lock's AFBC
+             * writeback races the presenter). */
+            if (e) dc = (*e == '1') ? 1 : 0;
+            else   dc = is_gnome() ? 1 : 0;
+        }
         if (dc) copy_to_dumb(h);
         present_hwc2(h);
     }
