@@ -563,7 +563,13 @@ ssize_t read(int fd, void *buf, size_t count) {
 }
 static int synth_poll_fixup(struct pollfd *fds, nfds_t n) {
     if (!g_synth_active || g_synth_qn <= 0) return -1;
-    if (now_ns() < g_synth_q[g_synth_qh].deadline) return -1; /* not due yet */
+    /* NO deadline gating here: this path serves GLib/ppoll compositors
+     * (mutter/gnome-mali) which have no timerfd to wake them at the deadline --
+     * gating made them sleep on their own ppoll timeout waiting for a flip
+     * that was waiting for them (frame clock stall, shell wedge). Immediate
+     * delivery is the historical, working behavior for this path; vsync
+     * pacing applies only to the epoll path where the timerfd guarantees a
+     * wake-up (wlroots/phoc). */
     for (nfds_t i = 0; i < n; i++)
         if (is_synth_fd(fds[i].fd) && (fds[i].events & POLLIN)) { fds[i].revents |= POLLIN; return (int)i; }
     return -1;
