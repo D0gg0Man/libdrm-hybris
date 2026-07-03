@@ -1,25 +1,23 @@
-CC = gcc
+CC     ?= gcc
+CFLAGS ?= -O2 -fPIC -shared -Wall -Wextra \
+          -I/usr/include/libdrm \
+          -I/usr/include \
+          -I/usr/include/android
+LIBDIR ?= /usr/lib/aarch64-linux-gnu
 
-CFLAGS = -O2 -fPIC -I/usr/include/android `pkg-config --cflags glib-2.0 wayland-server libdrm`
-LDFLAGS = -shared `pkg-config --libs glib-2.0 wayland-server libdrm libgralloc`
+OUT = built/libdrm-hybris.so
 
-SOURCES = src/libdrm-hybris.c
+.PHONY: all clean install
 
-TARGET  = libdrm-hybris.so
+all: $(OUT)
 
-PREFIX ?= /usr
-TRIPLET ?= $(shell $(CC) -dumpmachine)
+$(OUT): src/libdrm-hybris.c
+	mkdir -p built
+	$(CC) $(CFLAGS) -o $@ $< -ldl -lEGL -lgralloc -ldrm -lwayland-server
 
-all: $(TARGET)
-
-$(TARGET): $(SOURCES)
-	$(CC) $(SOURCES) -o $(TARGET) $(CFLAGS) $(LDFLAGS)
-
-install: $(TARGET)
-	install -d $(DESTDIR)$(PREFIX)/lib/$(TRIPLET)/libdrm-hybris/
-	install -m 0644 $(TARGET) $(DESTDIR)$(PREFIX)/lib/$(TRIPLET)/libdrm-hybris/
+install: all
+	install -d $(DESTDIR)$(LIBDIR)
+	install -m 755 $(OUT) $(DESTDIR)$(LIBDIR)/libdrm-hybris.so
 
 clean:
-	rm -f $(TARGET)
-
-.PHONY: all install clean
+	rm -f $(OUT)
