@@ -29,6 +29,8 @@
 #include <stdarg.h>
 #include <poll.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/timerfd.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <time.h>
@@ -418,13 +420,22 @@ static void tracef(const char *fmt, ...) {
  * ---------------------------------------------------------------------- */
 static int      g_synth_active   = 0;
 static int      g_drm_fd         = -1;
-static int      g_synth_pending  = 0;
-static uint32_t g_synth_crtc     = 0;
-static uint64_t g_synth_user     = 0;
 static uint64_t g_interval_ns    = 0;
 static uint64_t g_last_flip_ns   = 0;
-static uint64_t g_deadline_ns    = 0;
 static uint32_t g_synth_seq      = 0;
+
+/* Armed-but-undelivered synthetic flips. A QUEUE, not a single slot: flips are
+ * armed from several paths (atomic commits, legacy page-flip ioctls during
+ * modesets) and wlroots' user_data is a heap object (wlr_drm_page_flip) whose
+ * completion MUST be delivered exactly once. With a single slot, a second arm
+ * overwrote an undelivered first flip -- that flip's completion was lost,
+ * wlroots' conn->pending_page_flip never cleared, and it refused every further
+ * commit: the compositor froze (this was the intermittent cold-boot black and
+ * the post-blank freeze). */
+#define SYNTH_QMAX 16
+static struct { uint32_t crtc; uint64_t user; uint64_t deadline; } g_synth_q[SYNTH_QMAX];
+static int g_synth_qh = 0;   /* head index */
+static int g_synth_qn = 0;   /* queued count; >0 == "pending" */
 
 /* When the compositor nests the DRM fd inside an epoll instance and waits on
  * that epoll fd from an outer poll/ppoll (phoc: wl_event_loop epoll fd polled
@@ -433,6 +444,17 @@ static uint32_t g_synth_seq      = 0;
 static int          g_epoll_fd = -1;
 static epoll_data_t g_drm_epoll_data;
 static int          g_drm_epoll_valid = 0;
+/* Private eventfd we add to the compositor's DRM epoll so that arming a synth
+ * flip makes that epoll (and thus the outer GLib loop nesting it) OS-readable,
+ * waking the compositor to drill in and consume the flip even when it is
+ * otherwise idle (post-blank). Without this the outer loop blocks and the flip
+ * is only delivered when some real event happens to wake it (sparse) -> the
+ * shell freezes visually after an idle blank. Identified via ev.data.ptr. */
+static int          g_wake_fd = -1;
+/* Companion timerfd in the same epoll: wakes the loop AT the flip deadline
+ * (the compositor dispatches the inner epoll with timeout 0, so without a
+ * timer the vsync-aligned deadline would only be met on unrelated activity). */
+static int          g_timer_fd = -1;
 static int is_synth_fd(int fd) {
     return fd == g_drm_fd || (g_drm_epoll_valid && fd == g_epoll_fd);
 }
@@ -469,38 +491,80 @@ static uint64_t g_vsync_ns = 8333333ull;
 void drm_shim_set_vsync_period(uint64_t ns) {
     if (ns > 1000000ull && ns < 100000000ull) g_vsync_ns = ns;
 }
+/* Real panel vsync timestamps (CLOCK_MONOTONIC ns), stamped by drmadapter's
+ * HWC2 vsync callback. Used to phase-align the synthetic flip deadlines to the
+ * actual vblank: a free-running flip clock drifts against the panel and the
+ * presents periodically straddle the composer's latch point -> mixed old/new
+ * frames = flicker under motion (session-random severity = boot phase). */
+static uint64_t g_vsync_stamp_ns = 0;
+void drm_shim_vsync_stamp(int64_t ts) { if (ts > 0) g_vsync_stamp_ns = (uint64_t)ts; }
 static void synth_arm(uint32_t crtc, uint64_t user_data) {
-    g_synth_crtc = crtc;
-    g_synth_user = user_data;
-    g_deadline_ns = now_ns() + g_vsync_ns;
-    g_synth_pending = 1;
+    if (g_synth_qn >= SYNTH_QMAX) {
+        /* Should never happen (wlroots keeps <=1 flip in flight per connector);
+         * losing a flip means a permanent freeze, so scream if it ever does. */
+        fprintf(stderr, "libdrm-hybris: SYNTH QUEUE OVERFLOW, dropping oldest flip!\n");
+        g_synth_qh = (g_synth_qh + 1) % SYNTH_QMAX;
+        g_synth_qn--;
+    }
+    int tail = (g_synth_qh + g_synth_qn) % SYNTH_QMAX;
+    g_synth_q[tail].crtc = crtc;
+    g_synth_q[tail].user = user_data;
+    {
+        uint64_t now = now_ns();
+        uint64_t dl;
+        if (g_vsync_stamp_ns && now > g_vsync_stamp_ns &&
+            now - g_vsync_stamp_ns < 1000000000ull) {
+            /* Fresh vsync reference: deliver at the next real vblank boundary. */
+            uint64_t phase = (now - g_vsync_stamp_ns) % g_vsync_ns;
+            dl = now + (g_vsync_ns - phase);
+        } else {
+            dl = now + g_vsync_ns; /* fallback: free-running period */
+        }
+        g_synth_q[tail].deadline = dl;
+    }
+    g_synth_qn++;
     g_synth_active = 1;
+    /* Kick the wake eventfd so the compositor's (possibly idle) outer event loop
+     * wakes and drills into the DRM epoll to consume this flip. Drained+hidden in
+     * epoll_synth() so the compositor never sees the eventfd itself. */
+    if (g_wake_fd >= 0) { uint64_t one = 1; ssize_t w = write(g_wake_fd, &one, sizeof one); (void)w; }
+    /* Arm the deadline timer for the queue head (absolute monotonic). */
+    if (g_timer_fd >= 0) {
+        struct itimerspec its; memset(&its, 0, sizeof its);
+        uint64_t hd = g_synth_q[g_synth_qh].deadline;
+        its.it_value.tv_sec = hd / 1000000000ull;
+        its.it_value.tv_nsec = hd % 1000000000ull;
+        timerfd_settime(g_timer_fd, TFD_TIMER_ABSTIME, &its, NULL);
+    }
     STAMP("arm");
 }
 
 ssize_t read(int fd, void *buf, size_t count) {
     if (!real_read) real_read = (ssize_t(*)(int,void*,size_t))resolve_next("read",(void*)read);
-    if (!g_synth_active || fd != g_drm_fd || !g_synth_pending || in_hook)
+    if (!g_synth_active || fd != g_drm_fd || g_synth_qn <= 0 || in_hook)
         return real_read(fd, buf, count);
     if (count < sizeof(struct drm_event_vblank)) return real_read(fd, buf, count);
     struct drm_event_vblank ev; memset(&ev, 0, sizeof ev);
     ev.base.type   = DRM_EVENT_FLIP_COMPLETE;
     ev.base.length = sizeof ev;
-    ev.user_data   = g_synth_user;
+    ev.user_data   = g_synth_q[g_synth_qh].user;
     uint64_t n = now_ns();
     ev.tv_sec  = (uint32_t)(n / 1000000000ull);
     ev.tv_usec = (uint32_t)((n / 1000ull) % 1000000ull);
     ev.sequence = ++g_synth_seq;
-    ev.crtc_id  = g_synth_crtc;
+    ev.crtc_id  = g_synth_q[g_synth_qh].crtc;
     memcpy(buf, &ev, sizeof ev);
-    g_synth_pending = 0;
+    g_synth_qh = (g_synth_qh + 1) % SYNTH_QMAX;
+    g_synth_qn--;
     STAMP("read-deliver");
-    tracef("SYNTH read delivered crtc=%u user=0x%llx seq=%u\n", g_synth_crtc, (unsigned long long)g_synth_user, g_synth_seq);
+    tracef("SYNTH read delivered crtc=%u user=0x%llx seq=%u qn=%d\n",
+           ev.crtc_id, (unsigned long long)ev.user_data, g_synth_seq, g_synth_qn);
     return sizeof ev;
 }
 static int synth_poll_fixup(struct pollfd *fds, nfds_t n, struct timespec *cap) {
     (void)cap;
-    if (!g_synth_active || !g_synth_pending) return -1;
+    if (!g_synth_active || g_synth_qn <= 0) return -1;
+    if (now_ns() < g_synth_q[g_synth_qh].deadline) return -1; /* not due yet */
     for (nfds_t i = 0; i < n; i++)
         if (is_synth_fd(fds[i].fd) && (fds[i].events & POLLIN)) { fds[i].revents |= POLLIN; return (int)i; }
     return -1;
@@ -513,7 +577,7 @@ int poll(struct pollfd *fds, nfds_t n, int timeout) {
     if (r >= 0) return 1;
     if (r == -2) { int ms = (int)((cap.tv_sec*1000000000ll+cap.tv_nsec)/1000000)+1; if (timeout < 0 || timeout > ms) timeout = ms; }
     int got = real_poll(fds, n, timeout);
-    if (got == 0 && g_synth_pending && now_ns() >= g_deadline_ns)
+    if (got == 0 && g_synth_qn > 0 && now_ns() >= g_synth_q[g_synth_qh].deadline)
         for (nfds_t i = 0; i < n; i++)
             if (is_synth_fd(fds[i].fd) && (fds[i].events & POLLIN)) { fds[i].revents |= POLLIN; return 1; }
     return got;
@@ -528,7 +592,7 @@ int ppoll(struct pollfd *fds, nfds_t n, const struct timespec *to, const sigset_
     if (r == -2 && (!to || (uint64_t)to->tv_sec*1000000000ull+to->tv_nsec > (uint64_t)cap.tv_sec*1000000000ull+cap.tv_nsec))
         eff = &cap;
     int got = real_ppoll(fds, n, eff, ss);
-    if (got == 0 && g_synth_pending && now_ns() >= g_deadline_ns)
+    if (got == 0 && g_synth_qn > 0 && now_ns() >= g_synth_q[g_synth_qh].deadline)
         for (nfds_t i = 0; i < n; i++)
             if (is_synth_fd(fds[i].fd) && (fds[i].events & POLLIN)) { fds[i].revents |= POLLIN; return 1; }
     return got;
@@ -556,6 +620,28 @@ int epoll_ctl(int epfd, int op, int fd, struct epoll_event *ev) {
     if (is_compositor() && ev && (op == EPOLL_CTL_ADD || op == EPOLL_CTL_MOD) && fd_is_drm(fd)) {
         g_epoll_fd = epfd; g_drm_epoll_data = ev->data; g_drm_epoll_valid = 1;
         if (g_drm_fd < 0) g_drm_fd = fd;
+        /* Add our private wake eventfd to the SAME epoll so synth_arm() can make
+         * it readable and wake the (possibly idle) outer loop. */
+        if (g_wake_fd < 0) {
+            g_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+            if (g_wake_fd >= 0) {
+                struct epoll_event we; memset(&we, 0, sizeof we);
+                we.events = EPOLLIN; we.data.ptr = &g_wake_fd;
+                if (real_epoll_ctl(epfd, EPOLL_CTL_ADD, g_wake_fd, &we) != 0) {
+                    close(g_wake_fd); g_wake_fd = -1;
+                }
+            }
+        }
+        if (g_timer_fd < 0) {
+            g_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+            if (g_timer_fd >= 0) {
+                struct epoll_event te; memset(&te, 0, sizeof te);
+                te.events = EPOLLIN; te.data.ptr = &g_timer_fd;
+                if (real_epoll_ctl(epfd, EPOLL_CTL_ADD, g_timer_fd, &te) != 0) {
+                    close(g_timer_fd); g_timer_fd = -1;
+                }
+            }
+        }
         if (getenv("LIBDRM_HYBRIS_SAMPLE"))
             fprintf(stderr, "libdrm-hybris: epoll_ctl tracked DRM fd=%d epfd=%d data=0x%llx\n",
                     fd, epfd, (unsigned long long)ev->data.u64);
@@ -566,7 +652,27 @@ int epoll_ctl(int epfd, int op, int fd, struct epoll_event *ev) {
 static unsigned long g_epoll_inject = 0;
 static int epoll_synth(int epfd, struct epoll_event *events, int n, int maxevents) {
     if (n < 0) n = 0;
-    if (epfd != g_epoll_fd || !g_drm_epoll_valid || !g_synth_pending) return n;
+    if (epfd != g_epoll_fd || !g_drm_epoll_valid) return n;
+    /* Drain + hide our private wake eventfd: wl_event_loop would deref its
+     * data.ptr as a wl_event_source and crash, so it must never leak out. */
+    if (g_wake_fd >= 0 || g_timer_fd >= 0) {
+        if (!real_read) real_read = (ssize_t(*)(int,void*,size_t))resolve_next("read",(void*)read);
+        for (int i = 0; i < n; ) {
+            if (events[i].data.ptr == (void *)&g_wake_fd) {
+                uint64_t v; int sv = in_hook; in_hook = 1;
+                while (real_read && real_read(g_wake_fd, &v, sizeof v) == (ssize_t)sizeof v) {}
+                in_hook = sv;
+                events[i] = events[n - 1]; n--;
+            } else if (events[i].data.ptr == (void *)&g_timer_fd) {
+                uint64_t v; int sv = in_hook; in_hook = 1;
+                while (real_read && real_read(g_timer_fd, &v, sizeof v) == (ssize_t)sizeof v) {}
+                in_hook = sv;
+                events[i] = events[n - 1]; n--;
+            } else i++;
+        }
+    }
+    if (g_synth_qn <= 0) return n;
+    if (now_ns() < g_synth_q[g_synth_qh].deadline) return n; /* not due yet */
     g_epoll_inject++;
     STAMP("epoll-inject");
     for (int i = 0; i < n; i++)
@@ -580,7 +686,11 @@ static int epoll_synth(int epfd, struct epoll_event *events, int n, int maxevent
 }
 /* A pending flip must be delivered without blocking. */
 static int epoll_cap_timeout(int timeout) {
-    return g_synth_pending ? 0 : timeout;
+    if (g_synth_qn <= 0) return timeout;
+    int64_t rem = (int64_t)g_synth_q[g_synth_qh].deadline - (int64_t)now_ns();
+    if (rem <= 0) return 0;
+    int ms = (int)((rem + 999999) / 1000000); /* round up: no busy loop */
+    return (timeout >= 0 && timeout < ms) ? timeout : ms;
 }
 
 int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout) {
@@ -603,8 +713,8 @@ int epoll_pwait2(int epfd, struct epoll_event *events, int maxevents, const stru
     if (!g_synth_active || in_hook || epfd != g_epoll_fd || !g_drm_epoll_valid)
         return real_epoll_pwait2(epfd, events, maxevents, to, ss);
     struct timespec cap; const struct timespec *eff = to;
-    if (g_synth_pending) {
-        int64_t rem = (int64_t)g_deadline_ns - (int64_t)now_ns(); if (rem < 0) rem = 0;
+    if (g_synth_qn > 0) {
+        int64_t rem = (int64_t)g_synth_q[g_synth_qh].deadline - (int64_t)now_ns(); if (rem < 0) rem = 0;
         cap.tv_sec = rem / 1000000000; cap.tv_nsec = rem % 1000000000;
         uint64_t capn = (uint64_t)cap.tv_sec*1000000000ull + cap.tv_nsec;
         if (!to || (uint64_t)to->tv_sec*1000000000ull + to->tv_nsec > capn) eff = &cap;
@@ -908,8 +1018,7 @@ void drm_shim_panel_power(int on) {
     if (on == g_output_on) return;
     g_output_on = on;
     if (g_power_fn) g_power_fn(on);
-    if (getenv("LIBDRM_HYBRIS_SAMPLE"))
-        fprintf(stderr, "libdrm-hybris: drm_shim_panel_power -> %s\n", on ? "ON" : "OFF");
+    fprintf(stderr, "libdrm-hybris: drm_shim_panel_power -> %s\n", on ? "ON" : "OFF");
 }
 /* phoc queries this on input activity: if the panel was blanked, phoc forces it
  * back on (and repaints), so ANY input wakes the screen even when phosh's
@@ -957,10 +1066,13 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReqPtr req, uint32_t flags, void *u
     g_drm_fd = fd; synth_note_flip();
     g_commit_n++;
     STAMP("commit");
-    /* Present the framebuffer this commit actually scans out (captured from the
-     * plane's FB_ID property); fall back to the most-recent FB only if unknown. */
+    /* Present ONLY commits that carry a new framebuffer (FB_ID captured from the
+     * plane property). Commits WITHOUT one (cursor/gamma/empty commits -- frequent
+     * during interaction) must NOT present: the old "fall back to the most recent
+     * fmap buffer" guess re-presented a STALE frame between real ones, which is
+     * exactly the rapid flicker on any motion (static content = no interleaved
+     * empty commits = no flicker). */
     buffer_handle_t h = g_committed_fb ? find_by_fb(g_committed_fb) : NULL;
-    if (!h) for (int i=fmap_n-1; i>=0; i--) { h=find_gralloc(fmap[i].gem); if (h) break; }
     if (getenv("LIBDRM_HYBRIS_SAMPLE"))
         fprintf(stderr, "libdrm-hybris: atomicCommit #%lu flags=0x%x fb=%u h=%p arm=%d\n",
                 g_commit_n, flags, g_committed_fb, (void*)h, (flags & DRM_MODE_PAGE_FLIP_EVENT)?1:0);
@@ -971,7 +1083,25 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReqPtr req, uint32_t flags, void *u
      * panel-off, oscillating the backlight. (g_pending_active is left tracked
      * but unused as a harmless fallback hook.) */
     g_pending_active = -1;
-    if (h) { copy_to_dumb(h); present_hwc2(h); }
+    if (h) {
+        /* copy_to_dumb (per-frame CPU read of the render buffer) was needed on
+         * the mutter/gnome path; for phoc it is skippable -- and its WRITE-usage
+         * gralloc lock forces an AFBC writeback on unlock that RACES the blit's
+         * GPU sampling (intermittent stale/black frames = motion flicker; whether
+         * a session's buffers are AFBC or linear decides blank/flicker/clean).
+         * Keep it only if LIBDRM_HYBRIS_DUMBCOPY=1. */
+        static int dc = -1;
+        if (dc < 0) { const char *e = getenv("LIBDRM_HYBRIS_DUMBCOPY"); dc = (e && *e == '1') ? 1 : 0; }
+        if (dc) copy_to_dumb(h);
+        present_hwc2(h);
+    }
+    else if (g_committed_fb) {
+        /* A buffer WAS committed but didn't resolve to a gralloc -- real problem. */
+        static unsigned long z = 0;
+        if ((z++ % 300) == 0)
+            fprintf(stderr, "libdrm-hybris: PRESENT SKIPPED (unresolved fb=%u) #%lu commit=%lu fmap_n=%d gmap_n=%d\n",
+                    g_committed_fb, z, g_commit_n, fmap_n, gmap_n);
+    }
     g_committed_fb = 0;
     /* wlroots commits non-blocking and waits for a page-flip completion event
      * before scheduling the next frame. The HWC2 composer owns the CRTC so no
