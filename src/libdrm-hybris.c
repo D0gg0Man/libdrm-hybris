@@ -33,6 +33,7 @@
 #include <sys/timerfd.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <android/android-config.h>
 #include <hybris/gralloc/gralloc.h>
@@ -467,6 +468,16 @@ static uint64_t now_ns(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec;
 }
+static int g_traceall = -1;
+static void TRACEALL(const char *fmt, ...) {
+    if (g_traceall < 0) g_traceall = getenv("LIBDRM_HYBRIS_TRACE_ALL") ? 1 : 0;
+    if (!g_traceall) return;
+    va_list a; va_start(a, fmt);
+    fprintf(stderr, "drmtrace: ");
+    vfprintf(stderr, fmt, a);
+    fprintf(stderr, "\n");
+    va_end(a);
+}
 static int g_stamp = -1;
 static void STAMP(const char *tag) {
     if (g_stamp < 0) g_stamp = getenv("LIBDRM_HYBRIS_STAMP") ? 1 : 0;
@@ -498,6 +509,14 @@ void drm_shim_set_vsync_period(uint64_t ns) {
  * frames = flicker under motion (session-random severity = boot phase). */
 static uint64_t g_vsync_stamp_ns = 0;
 void drm_shim_vsync_stamp(int64_t ts) { if (ts > 0) g_vsync_stamp_ns = (uint64_t)ts; }
+/* KWin's legacy-KMS path wants master-gated state ioctls (gamma/cursor/property)
+ * faked to success; wlroots/phoc needs their real result during atomic output
+ * bring-up. Opt-in so only the KWin session changes behaviour. */
+static int fake_kms_state(void) {
+    static int f = -1;
+    if (f < 0) f = getenv("LIBDRM_HYBRIS_FAKE_KMS_STATE") ? 1 : 0;
+    return f;
+}
 static void synth_arm(uint32_t crtc, uint64_t user_data) {
     if (g_synth_qn >= SYNTH_QMAX) {
         /* Should never happen (wlroots keeps <=1 flip in flight per connector);
@@ -512,7 +531,17 @@ static void synth_arm(uint32_t crtc, uint64_t user_data) {
     {
         uint64_t now = now_ns();
         uint64_t dl;
-        if (g_vsync_stamp_ns && now > g_vsync_stamp_ns &&
+        /* LIBDRM_HYBRIS_FAST_COMPLETE: deliver the completion immediately
+         * instead of at the next vblank. For compositors whose present is
+         * fully decoupled from the flip (KWin QPainter + drmadapter's async
+         * present worker) the vblank wait only serializes the frame pipeline
+         * -- there is no real scanout to tear against. phoc/mutter keep the
+         * vsync-aligned pacing (their present happens inside the flip). */
+        static int fast = -1;
+        if (fast < 0) fast = getenv("LIBDRM_HYBRIS_FAST_COMPLETE") ? 1 : 0;
+        if (fast) {
+            dl = now;
+        } else if (g_vsync_stamp_ns && now > g_vsync_stamp_ns &&
             now - g_vsync_stamp_ns < 1000000000ull) {
             /* Fresh vsync reference: deliver at the next real vblank boundary. */
             uint64_t phase = (now - g_vsync_stamp_ns) % g_vsync_ns;
@@ -539,6 +568,7 @@ static void synth_arm(uint32_t crtc, uint64_t user_data) {
     STAMP("arm");
 }
 
+static uint64_t g_last_deliver_ns = 0;  /* when the last synth completion reached the compositor */
 ssize_t read(int fd, void *buf, size_t count) {
     if (!real_read) real_read = (ssize_t(*)(int,void*,size_t))resolve_next("read",(void*)read);
     if (!g_synth_active || fd != g_drm_fd || g_synth_qn <= 0 || in_hook)
@@ -556,6 +586,7 @@ ssize_t read(int fd, void *buf, size_t count) {
     memcpy(buf, &ev, sizeof ev);
     g_synth_qh = (g_synth_qh + 1) % SYNTH_QMAX;
     g_synth_qn--;
+    g_last_deliver_ns = n;
     STAMP("read-deliver");
     tracef("SYNTH read delivered crtc=%u user=0x%llx seq=%u qn=%d\n",
            ev.crtc_id, (unsigned long long)ev.user_data, g_synth_seq, g_synth_qn);
@@ -763,6 +794,14 @@ void drm_shim_set_present(int (*fn)(buffer_handle_t)) {
     g_present_fn = fn;
     if (getenv("LIBDRM_HYBRIS_SAMPLE")) fprintf(stderr, "libdrm-hybris: present callback registered fn=%p\n", (void*)fn);
 }
+/* Single-pass CPU present (QPainter/software compositors): drmadapter copies
+ * the dumb-buffer mapping straight into its present buffer, skipping the
+ * intermediate gralloc scratch copy this shim otherwise does. */
+static int (*g_present_cpu_fn)(const void *, uint32_t) = NULL;
+void drm_shim_set_present_cpu(int (*fn)(const void *, uint32_t)) {
+    g_present_cpu_fn = fn;
+    if (getenv("LIBDRM_HYBRIS_SAMPLE")) fprintf(stderr, "libdrm-hybris: cpu present callback registered fn=%p\n", (void*)fn);
+}
 /* drmadapter also registers a power callback so we can drive the real HWC2
  * display power off/on when wlroots toggles the CRTC ACTIVE state (DPMS). The
  * faked atomic commit otherwise never touches the panel power: "blanking" just
@@ -889,6 +928,198 @@ static int init_dumb(int fd) {
     in_hook=saved; return 0;
 }
 
+/* --- QPainter (software) present bridge ------------------------------------
+ * KWin's QPainter DRM backend renders into DRM *dumb* buffers (CPU-mapped) and
+ * page-flips them. Those aren't gralloc buffers, so present_hwc2() can't hand
+ * them to HWC2. Track each dumb buffer's CPU mapping (from CREATE_DUMB /
+ * MAP_DUMB), and on flip copy the composited pixels into a gralloc scratch
+ * buffer that we present through the normal HWC2 path. This is the pure-software
+ * compositing path that avoids the Mali GL driver (and its render corruption)
+ * entirely. */
+#define KDUMB_MAX 8
+static struct { uint32_t gem; void *cpu; size_t size; uint32_t pitch; int memfd; } kdumb[KDUMB_MAX];
+static int kdumb_n = 0;
+
+/* --- Cached (memfd-backed) dumb buffers for the KWin QPainter path ---------
+ * Real DRM dumb buffers mmap as write-combined memory: QPainter's blending
+ * (read-modify-write) and our per-frame present readback both stall badly on
+ * WC reads (~10-30ms per 1080p+ frame each). The faked KMS never scans these
+ * buffers out -- they only ever live as a CPU canvas -- so back them with
+ * plain CACHED anonymous memory (memfd) instead. CREATE_DUMB/MAP_DUMB are
+ * answered without the kernel; the compositor's subsequent mmap() on the DRM
+ * fd is redirected to the memfd by the mmap interpose below (magic offset).
+ * Gated on LIBDRM_HYBRIS_FAKE_KMS_STATE (the KWin session): phoc/mutter keep
+ * real dumb buffers. */
+#define KDUMB_FAKE_GEM(i)   (0x4B440000u | (uint32_t)(i))
+#define KDUMB_IS_FAKE(h)    (((h) & 0xFFFF0000u) == 0x4B440000u)
+#define KDUMB_FAKE_OFF(i)   ((0x4B44ull << 40) | ((uint64_t)(i) << 20))
+#define KDUMB_OFF_MAGIC(o)  (((uint64_t)(o) >> 40) == 0x4B44ull)
+#define KDUMB_OFF_IDX(o)    ((int)(((uint64_t)(o) >> 20) & 0xFFFFFu))
+
+static int kdumb_slot_by_gem(uint32_t gem) {
+    for (int i = 0; i < kdumb_n; i++) if (kdumb[i].gem == gem) return i;
+    return -1;
+}
+static int kdumb_create_memfd(struct drm_mode_create_dumb *cd) {
+    int slot = -1;
+    for (int i = 0; i < kdumb_n; i++) if (!kdumb[i].gem) { slot = i; break; }
+    if (slot < 0) {
+        if (kdumb_n >= KDUMB_MAX) return -ENOMEM;
+        slot = kdumb_n++;
+    }
+    /* Deferred unmap from a previous DESTROY_DUMB of this slot (see below). */
+    if (kdumb[slot].cpu) { munmap(kdumb[slot].cpu, kdumb[slot].size); kdumb[slot].cpu = NULL; }
+    uint32_t pitch = cd->width * ((cd->bpp + 7) / 8);
+    size_t size = ((size_t)pitch * cd->height + 4095) & ~(size_t)4095;
+    int mfd = (int)syscall(SYS_memfd_create, "libdrm-hybris-dumb", 0);
+    if (mfd < 0) return -errno;
+    if (ftruncate(mfd, (off_t)size) < 0) { int e = errno; close(mfd); return -e; }
+    void *cpu = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+    if (cpu == MAP_FAILED) { int e = errno; close(mfd); return -e; }
+    kdumb[slot].gem = KDUMB_FAKE_GEM(slot);
+    kdumb[slot].cpu = cpu;
+    kdumb[slot].size = size;
+    kdumb[slot].pitch = pitch;
+    kdumb[slot].memfd = mfd;
+    cd->handle = kdumb[slot].gem;
+    cd->pitch = pitch;
+    cd->size = size;
+    if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+        fprintf(stderr, "libdrm-hybris: kdumb memfd create %ux%u gem=0x%x fd=%d (cached)\n",
+                cd->width, cd->height, cd->handle, mfd);
+    return 0;
+}
+static void kdumb_destroy_memfd(uint32_t gem) {
+    int i = kdumb_slot_by_gem(gem);
+    if (i < 0) return;
+    /* Keep the CPU mapping alive: the async present worker may still be
+     * copying from it (~ms). It is munmapped when the slot is reused, by
+     * which point every in-flight frame has long been presented. */
+    if (kdumb[i].memfd >= 0) close(kdumb[i].memfd);
+    kdumb[i].gem = 0; kdumb[i].memfd = -1;
+}
+/* mmap interpose: redirect the compositor's mapping of a fake dumb offset to
+ * the backing memfd. Passthrough goes straight to the kernel (raw syscall) so
+ * there is no dlsym/recursion hazard; everything not carrying the magic
+ * offset is untouched. aarch64 mmap takes the byte offset directly. */
+void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
+    if (KDUMB_OFF_MAGIC(offset)) {
+        int idx = KDUMB_OFF_IDX(offset);
+        if (idx >= 0 && idx < kdumb_n && kdumb[idx].memfd >= 0)
+            return (void *)syscall(SYS_mmap, addr, length, prot, flags, kdumb[idx].memfd, (off_t)0);
+    }
+    return (void *)syscall(SYS_mmap, addr, length, prot, flags, fd, offset);
+}
+void *mmap64(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
+    __attribute__((alias("mmap")));
+static buffer_handle_t g_qp_gralloc = NULL;
+static uint32_t g_qp_stride = 0;
+static void kdumb_note_create(uint32_t gem, size_t size, uint32_t pitch) {
+    if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+        fprintf(stderr, "libdrm-hybris: kdumb_create gem=%u size=%zu pitch=%u\n", gem, size, pitch);
+    for (int i=0;i<kdumb_n;i++) if (kdumb[i].gem==gem){ kdumb[i].size=size; kdumb[i].pitch=pitch; kdumb[i].cpu=NULL; return; }
+    if (kdumb_n<KDUMB_MAX){ kdumb[kdumb_n].gem=gem; kdumb[kdumb_n].cpu=NULL; kdumb[kdumb_n].size=size; kdumb[kdumb_n].pitch=pitch; kdumb_n++; }
+}
+static void kdumb_note_map(int fd, uint32_t gem, uint64_t offset) {
+    for (int i=0;i<kdumb_n;i++) if (kdumb[i].gem==gem){
+        if (!kdumb[i].cpu && kdumb[i].size){
+            int sv=in_hook; in_hook=1;
+            void *m = mmap(NULL, kdumb[i].size, PROT_READ, MAP_SHARED, fd, (off_t)offset);
+            in_hook=sv;
+            if (m!=MAP_FAILED) kdumb[i].cpu=m;
+            if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+                fprintf(stderr, "libdrm-hybris: kdumb_map gem=%u size=%zu off=0x%llx -> %p (errno=%d)\n",
+                        gem, kdumb[i].size, (unsigned long long)offset, m, errno);
+        }
+        return;
+    }
+    if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+        fprintf(stderr, "libdrm-hybris: kdumb_map gem=%u NOT in kdumb (n=%d)\n", gem, kdumb_n);
+}
+/* KWin exports each dumb buffer with drmPrimeHandleToFD (dumb gem -> fd) and
+ * then builds the scanout FB from that fd's handle, so the flipped fb's "gem"
+ * is the exported fd, not the CREATE_DUMB handle. Map fd -> dumb gem so we can
+ * still find the CPU mapping. */
+static struct { int fd; uint32_t dumb_gem; } primemap[MAX];
+static int primemap_n = 0;
+static void primemap_add(int fd, uint32_t dumb_gem) {
+    for (int i=0;i<primemap_n;i++) if (primemap[i].fd==fd){ primemap[i].dumb_gem=dumb_gem; return; }
+    if (primemap_n<MAX){ primemap[primemap_n].fd=fd; primemap[primemap_n].dumb_gem=dumb_gem; primemap_n++; }
+    else { primemap[0].fd=fd; primemap[0].dumb_gem=dumb_gem; }
+}
+static uint32_t primemap_dumb(uint32_t fd) {
+    for (int i=0;i<primemap_n;i++) if ((uint32_t)primemap[i].fd==fd) return primemap[i].dumb_gem;
+    return 0;
+}
+static void *kdumb_cpu(uint32_t gem, uint32_t *pitch) {
+    for (int i=0;i<kdumb_n;i++) if (kdumb[i].gem==gem){ if(pitch)*pitch=kdumb[i].pitch; return kdumb[i].cpu; }
+    uint32_t dg = primemap_dumb(gem);   /* gem may be the exported prime fd */
+    if (dg) for (int i=0;i<kdumb_n;i++) if (kdumb[i].gem==dg){ if(pitch)*pitch=kdumb[i].pitch; return kdumb[i].cpu; }
+    return NULL;
+}
+/* KWin's QPainter backend never initialises EGL, so the drmadapter platform
+ * (which registers drm_shim_set_present + brings up HWC2 in its init_module) is
+ * never loaded. Force it: dlopen libEGL and eglInitialize once, which loads the
+ * HYBRIS_EGLPLATFORM=drmadapter module and wires up g_present_fn + HWC2. */
+static void ensure_present_fn(void) {
+    if (g_present_fn) return;
+    static int tried = 0;
+    if (tried) return;
+    tried = 1;
+    int sv = in_hook; in_hook = 1;
+    void *egl = dlopen("libEGL.so.1", RTLD_NOW | RTLD_GLOBAL);
+    if (egl) {
+        void *(*getdisp)(void *) = (void *(*)(void *))dlsym(egl, "eglGetDisplay");
+        unsigned (*init)(void *, int *, int *) = (unsigned(*)(void *,int *,int *))dlsym(egl, "eglInitialize");
+        if (getdisp && init) {
+            void *d = getdisp((void *)0);          /* EGL_DEFAULT_DISPLAY */
+            if (d) { int mj = 0, mn = 0; init(d, &mj, &mn); }
+        }
+    }
+    in_hook = sv;
+    if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+        fprintf(stderr, "libdrm-hybris: forced drmadapter EGL init, present_fn=%p\n", (void *)g_present_fn);
+}
+static int present_qpainter_dumb(uint32_t gem) {
+    uint32_t spitch=0;
+    void *src = kdumb_cpu(gem, &spitch);
+    if (getenv("LIBDRM_HYBRIS_SAMPLE")) {
+        static int n=0;
+        if (n++ < 5) fprintf(stderr, "libdrm-hybris: present_qpainter_dumb(gem=%u) src=%p kdumb_n=%d fw=%u\n",
+                             gem, src, kdumb_n, frame_w);
+    }
+    if (!src || !frame_w || !frame_h) return 0;
+    ensure_present_fn();
+    /* Preferred: hand the dumb mapping straight to drmadapter for a single
+     * swizzling copy into its present buffer (one full-frame pass instead of
+     * two). When registered, it is authoritative: on failure (HWC2 not up yet)
+     * skip the frame rather than fall through -- the scratch path below would
+     * call hybris_gralloc_allocate before gralloc is loaded and assert. */
+    if (g_present_cpu_fn) {
+        return g_present_cpu_fn(src, spitch ? spitch : frame_w * 4) == 0 ? 1 : 0;
+    }
+    if (!g_qp_gralloc) {
+        const int usage = 0x1000|0x800|0x200|0x33;   /* FB|COMPOSER|RENDER|SW rw */
+        if (hybris_gralloc_allocate((int)frame_w, (int)frame_h, 1 /*RGBA_8888*/, usage,
+                                    &g_qp_gralloc, &g_qp_stride) || !g_qp_gralloc) {
+            g_qp_gralloc=NULL; return 0;
+        }
+    }
+    void *dst=NULL;
+    if (hybris_gralloc_lock(g_qp_gralloc, 0x3|0x30, 0, 0, (int)frame_w, (int)frame_h, &dst) || !dst) return 0;
+    uint32_t dpitch = g_qp_stride*4;
+    if (!spitch) spitch = frame_w*4;
+    for (uint32_t y=0;y<frame_h;y++)
+        memcpy((uint8_t*)dst + (size_t)y*dpitch, (uint8_t*)src + (size_t)y*spitch, (size_t)frame_w*4);
+    hybris_gralloc_unlock(g_qp_gralloc);
+    present_hwc2(g_qp_gralloc);
+    return 1;
+}
+static uint32_t find_gem_by_fb(uint32_t fb_id) {
+    for (int i=0;i<fmap_n;i++) if (fmap[i].fb_id==fb_id) return fmap[i].gem;
+    return 0;
+}
+
 int drmModeAddFB2WithModifiers(int fd, uint32_t w, uint32_t h, uint32_t fmt,
     const uint32_t handles[4], const uint32_t pitches[4], const uint32_t offsets[4],
     const uint64_t mod[4], uint32_t *buf_id, uint32_t flags) {
@@ -901,11 +1132,14 @@ int drmModeAddFB2WithModifiers(int fd, uint32_t w, uint32_t h, uint32_t fmt,
     }
     if (!frame_w) { frame_w=w; frame_h=h; }
     if (!dumb_map) init_dumb(fd);
-    uint32_t id=next_fake++; *buf_id=id; fmap_insert(handles[0],id); return 0;
+    uint32_t id=next_fake++; *buf_id=id; fmap_insert(handles[0],id);
+    if (getenv("LIBDRM_HYBRIS_SAMPLE")) fprintf(stderr,"libdrm-hybris: AddFB2Mod fb=%u handle0=%u\n",id,handles[0]);
+    return 0;
 }
 int drmModeAddFB2(int fd, uint32_t w, uint32_t h, uint32_t fmt,
     const uint32_t handles[4], const uint32_t pitches[4], const uint32_t offsets[4],
     uint32_t *buf_id, uint32_t flags) {
+    TRACEALL("drmModeAddFB2");
     if (!is_compositor()) {
         typedef int (*fn_t)(int,uint32_t,uint32_t,uint32_t,const uint32_t*,
                             const uint32_t*,const uint32_t*,uint32_t*,uint32_t);
@@ -914,7 +1148,11 @@ int drmModeAddFB2(int fd, uint32_t w, uint32_t h, uint32_t fmt,
     }
     if (!frame_w) { frame_w=w; frame_h=h; }
     if (!dumb_map) init_dumb(fd);
-    uint32_t id=next_fake++; *buf_id=id; fmap_insert(handles[0],id); return 0;
+    uint32_t id=next_fake++; *buf_id=id; fmap_insert(handles[0],id);
+    if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+        fprintf(stderr, "libdrm-hybris: AddFB2 fb=%u handle0=%u pitch0=%u %ux%u\n",
+                id, handles[0], pitches?pitches[0]:0, w, h);
+    return 0;
 }
 int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle) {
     typedef int (*fn_t)(int,int,uint32_t*);
@@ -928,9 +1166,40 @@ int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle) {
      * prime_fd -> gralloc mapping (gmap) and find_gralloc()/find_by_fb() key on
      * the prime fd, so AddFB2/commit can still recover the buffer. */
     if (r != 0 && handle) { *handle = (uint32_t)prime_fd; r = 0; }
+    if (getenv("LIBDRM_HYBRIS_SAMPLE") && handle) fprintf(stderr,"libdrm-hybris: PrimeFDToHandle fd=%d -> handle=%u\n",prime_fd,*handle);
+    return r;
+}
+/* Reverse of the above: KWin's QPainter (software) compositing backend allocates
+ * its swapchain buffer via gbm and then exports it with drmPrimeHandleToFD to get
+ * a dmabuf fd. The real ioctl needs DRM master (the HWC2 composer owns it) and
+ * returns EACCES -> "Failed to allocate a qpainter swapchain graphics buffer".
+ * Our GEM handle IS the gbm_hybris prime fd (see drmPrimeFDToHandle), so just dup
+ * it back. This lets KWin composite in software with zero Mali GL -- the escape
+ * hatch from the Mali/hybris GL-render corruption. */
+int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd) {
+    typedef int (*fn_t)(int,uint32_t,uint32_t,int*);
+    fn_t real=(fn_t)resolve_next("drmPrimeHandleToFD",(void*)drmPrimeHandleToFD);
+    if (!is_compositor() || is_gnome())
+        return real ? real(fd,handle,flags,prime_fd) : -ENOSYS;
+    /* Memfd-backed fake dumb buffer: "export" the memfd itself. */
+    if (KDUMB_IS_FAKE(handle) && prime_fd) {
+        int slot = kdumb_slot_by_gem(handle);
+        if (slot >= 0 && kdumb[slot].memfd >= 0) {
+            int dfd = dup(kdumb[slot].memfd);
+            if (dfd >= 0) { *prime_fd = dfd; primemap_add(dfd, handle); return 0; }
+        }
+        return -EINVAL;
+    }
+    int r = real ? real(fd,handle,flags,prime_fd) : -EACCES;
+    if (r != 0 && prime_fd) {
+        int dfd = dup((int)handle);       /* handle == the gbm_hybris prime fd */
+        if (dfd >= 0) { *prime_fd = dfd; r = 0; primemap_add(dfd, handle); }
+        if (getenv("LIBDRM_HYBRIS_SAMPLE")) fprintf(stderr,"libdrm-hybris: PrimeHandleToFD handle=%u -> fd=%d\n",handle,dfd);
+    }
     return r;
 }
 int drmModeRmFB(int fd, uint32_t id) {
+    TRACEALL("drmModeRmFB");
     if (!is_compositor()) {
         typedef int (*fn_t)(int,uint32_t);
         fn_t real=(fn_t)resolve_next("drmModeRmFB",(void*)drmModeRmFB);
@@ -940,27 +1209,85 @@ int drmModeRmFB(int fd, uint32_t id) {
 }
 int drmModeSetCrtc(int fd, uint32_t crtcId, uint32_t bufferId, uint32_t x, uint32_t y,
     uint32_t *connectors, int count, drmModeModeInfoPtr mode) {
+    TRACEALL("drmModeSetCrtc");
     if (!is_compositor()) {
         typedef int (*fn_t)(int,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t*,int,drmModeModeInfoPtr);
         fn_t real=(fn_t)resolve_next("drmModeSetCrtc",(void*)drmModeSetCrtc);
         return real ? real(fd,crtcId,bufferId,x,y,connectors,count,mode) : -ENOSYS;
     }
-    if (!dumb_map) init_dumb(fd); return 0;
+    if (!dumb_map) init_dumb(fd);
+    /* KWin's QPainter backend presents its very first frame via a modeset, then
+     * page-flips. Present that first dumb buffer too so the panel isn't blank
+     * until the first flip. Only fires for tracked dumb buffers (gralloc paths
+     * return h!=NULL and are handled by their flip/commit). */
+    if (bufferId) {
+        buffer_handle_t h = find_by_fb(bufferId);
+        if (!h) present_qpainter_dumb(find_gem_by_fb(bufferId));
+    }
+    return 0;
 }
 int drmModePageFlip(int fd, uint32_t crtc_id, uint32_t fb_id, uint32_t flags, void *ud) {
+    TRACEALL("drmModePageFlip");
     typedef int (*fn_t)(int,uint32_t,uint32_t,uint32_t,void*);
     fn_t real=(fn_t)resolve_next("drmModePageFlip",(void*)drmModePageFlip);
     if (!is_compositor())
         return real ? real(fd,crtc_id,fb_id,flags,ud) : -ENOSYS;
     g_drm_fd = fd; synth_note_flip();
-    buffer_handle_t h=find_by_fb(fb_id); copy_to_dumb(h); present_hwc2(h);
+    buffer_handle_t h=find_by_fb(fb_id);
+    if (h) { copy_to_dumb(h); present_hwc2(h); }
+    else present_qpainter_dumb(find_gem_by_fb(fb_id));  /* KWin QPainter dumb buffer */
+    /* Drive the real ioctl exactly as before -- it re-enters our raw-ioctl hook
+     * (nr 0xb0), which is where the completion is synthesized. Arming here too
+     * would deliver the completion twice per flip. copy_to_dumb + real() stay
+     * unconditional: phoc (wlroots) also takes this legacy path and breaks
+     * without them. */
     int r = real ? real(fd,crtc_id,dumb_fb_id?dumb_fb_id:fb_id,flags,ud) : 0;
-    if (r == -EACCES) {
-        if (flags & DRM_MODE_PAGE_FLIP_EVENT)
-            synth_arm(crtc_id, (uint64_t)(uintptr_t)ud);
-        r = 0;
+    return (r == -EACCES) ? 0 : r;
+}
+
+/* Force an OpenGL ES 3.x context when LIBDRM_HYBRIS_FORCE_GLES3 is set.
+ *
+ * KWin 6's GL renderer unconditionally uses ES 3.0 entry points (glMapBufferRange
+ * et al.) when drawing client window items. On the libhybris/drmadapter stack the
+ * context otherwise comes up as ES 2.0, so libepoxy finds no provider for those
+ * symbols and abort()s the compositor the instant a client presents a buffer. The
+ * Mali-G68 driver is ES 3.2 capable, so bumping the requested client version fixes
+ * it. Env-gated: only the KWin session opts in; phosh/GNOME/mutter keep their ES2
+ * contexts and see an exact pass-through (LD_PRELOAD is scrubbed under KWin's
+ * AT_SECURE launch, so this must live in the ld.so.preload shim to take effect). */
+EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config,
+                            EGLContext share_context, const EGLint *attrib_list) {
+    typedef EGLContext (*fn_t)(EGLDisplay, EGLConfig, EGLContext, const EGLint *);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)resolve_next("eglCreateContext", (void *)eglCreateContext);
+    if (!real) return EGL_NO_CONTEXT;
+
+    static int force = -1;
+    if (force < 0) force = getenv("LIBDRM_HYBRIS_FORCE_GLES3") ? 1 : 0;
+    if (!force) return real(dpy, config, share_context, attrib_list);
+
+    EGLint buf[64]; int n = 0, seen = 0;
+    if (attrib_list) {
+        for (int i = 0; attrib_list[i] != EGL_NONE && n < 60; i += 2) {
+            EGLint k = attrib_list[i], v = attrib_list[i + 1];
+            /* EGL_CONTEXT_CLIENT_VERSION == EGL_CONTEXT_MAJOR_VERSION_KHR (0x3098) */
+            if (k == EGL_CONTEXT_CLIENT_VERSION) { if (v < 3) v = 3; seen = 1; }
+            buf[n++] = k; buf[n++] = v;
+        }
     }
-    return r;
+    if (!seen && n < 60) { buf[n++] = EGL_CONTEXT_CLIENT_VERSION; buf[n++] = 3; }
+    buf[n] = EGL_NONE;
+
+    EGLContext c = real(dpy, config, share_context, buf);
+    if (getenv("LIBDRM_HYBRIS_STAMP"))
+        fprintf(stderr, "libdrm-hybris: eglCreateContext ES3 cfg=%p share=%p -> %p\n",
+                config, share_context, c);
+    if (c == EGL_NO_CONTEXT) {         /* config can't do ES3 -> honour original */
+        c = real(dpy, config, share_context, attrib_list);
+        if (getenv("LIBDRM_HYBRIS_STAMP"))
+            fprintf(stderr, "libdrm-hybris: eglCreateContext ES3 FAILED, fallback -> %p\n", c);
+    }
+    return c;
 }
 /* The synthetic flip event must carry the real CRTC id: wlroots' version-3
  * page_flip_handler2 matches the event to a connector by crtc_id
@@ -1053,6 +1380,7 @@ int drmModeAtomicAddProperty(drmModeAtomicReqPtr req, uint32_t obj, uint32_t pro
 }
 
 int drmModeAtomicCommit(int fd, drmModeAtomicReqPtr req, uint32_t flags, void *ud) {
+    TRACEALL("drmModeAtomicCommit flags=0x%x", flags);
     if (!is_compositor()) {
         typedef int (*fn_t)(int,drmModeAtomicReqPtr,uint32_t,void*);
         fn_t real=(fn_t)resolve_next("drmModeAtomicCommit",(void*)drmModeAtomicCommit);
@@ -1135,6 +1463,7 @@ int ioctl(int fd, unsigned long request, ...) {
     if (in_hook) return real_ioctl(fd,request,arg);
     uint32_t nr=request&0xff;
     in_hook=1; int ret;
+    TRACEALL("ioctl nr=0x%02x", nr);
     if (nr==0xb8) {
         uint32_t *fb=arg, w=fb[0], h=fb[1], gem=fb[5];
         if (!frame_w) { frame_w=w; frame_h=h; }
@@ -1145,16 +1474,49 @@ int ioctl(int fd, unsigned long request, ...) {
         if (!dumb_map) init_dumb(fd);
         real_ioctl(fd,request,arg); ret=0;
     } else if (nr==0xb0||nr==0xb6) {
+        /* Legacy PAGE_FLIP (KWin's legacy DRM path). Present via HWC2 and ALWAYS
+         * synthesize the completion event: the real ioctl against the faked KMS
+         * state can return 0 (not just EACCES), and without the completion the
+         * compositor never schedules the next frame (renders 1-2 frames then
+         * idles on a black screen). */
         struct drm_mode_crtc_page_flip *flip=arg;
         g_drm_fd=fd; synth_note_flip();
-        buffer_handle_t h=find_by_fb(flip->fb_id); copy_to_dumb(h); present_hwc2(h);
+        buffer_handle_t h=find_by_fb(flip->fb_id);
+        /* Frame-cycle profiling (LIBDRM_HYBRIS_PROF): flip-to-flip interval =
+         * the compositor's whole frame period (composite + present + pacing). */
+        {
+            static int prof = -1;
+            if (prof < 0) prof = getenv("LIBDRM_HYBRIS_PROF") ? 1 : 0;
+            if (prof) {
+                static struct timespec last; static double acc = 0.0, accP = 0.0; static int n = 0;
+                struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+                if (last.tv_sec) {
+                    acc += (now.tv_sec - last.tv_sec) * 1e3 + (now.tv_nsec - last.tv_nsec) / 1e6;
+                    /* produce = completion-delivery -> this flip: the compositor's
+                     * own frame time (composite + client sync), pacing excluded. */
+                    uint64_t nn = (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+                    if (g_last_deliver_ns && nn > g_last_deliver_ns)
+                        accP += (nn - g_last_deliver_ns) / 1e6;
+                    if (++n >= 30) {
+                        fprintf(stderr, "libdrm-hybris: flip-to-flip avg %.2f ms (%.1f fps) | produce avg %.2f ms\n",
+                                acc / n, n * 1000.0 / acc, accP / n);
+                        acc = 0.0; accP = 0.0; n = 0;
+                    }
+                }
+                last = now;
+            }
+        }
+        if (h) { copy_to_dumb(h); present_hwc2(h); }
+        else present_qpainter_dumb(find_gem_by_fb(flip->fb_id));  /* KWin QPainter dumb buffer */
         if (dumb_fb_id) flip->fb_id=dumb_fb_id;
         ret=real_ioctl(fd,request,arg);
-        if (ret!=0 && errno==EACCES) {
-            if (flip->flags & DRM_MODE_PAGE_FLIP_EVENT)
-                synth_arm(flip->crtc_id, flip->user_data);
-            ret=0;
-        }
+        /* Arm regardless of the real result: phoc's flip returns EACCES (as
+         * before), KWin's returns 0 -- both need the synthetic completion or the
+         * repaint loop stalls. copy_to_dumb + real_ioctl stay unconditional so
+         * the wlroots (phoc) legacy path is byte-for-byte as it was. */
+        if (flip->flags & DRM_MODE_PAGE_FLIP_EVENT)
+            synth_arm(flip->crtc_id, flip->user_data);
+        ret=0;
     } else if (nr==0xbc) {
         for (int i=fmap_n-1; i>=0; i--) {
             buffer_handle_t h=find_gralloc(fmap[i].gem);
@@ -1162,6 +1524,42 @@ int ioctl(int fd, unsigned long request, ...) {
         }
         ret=0;
     } else if (nr==0x11) { ret=0;
+    } else if (nr==0xb2) {                 /* CREATE_DUMB (KWin QPainter swapchain) */
+        if (fake_kms_state()) {
+            /* Cached memfd-backed dumb buffer (never scanned out; see above). */
+            ret=kdumb_create_memfd((struct drm_mode_create_dumb *)arg);
+        } else {
+            ret=real_ioctl(fd,request,arg);
+            if (ret==0) { struct drm_mode_create_dumb *cd=arg; kdumb_note_create(cd->handle, (size_t)cd->size, cd->pitch); }
+        }
+    } else if (nr==0xb3) {                 /* MAP_DUMB */
+        struct drm_mode_map_dumb *md=arg;
+        if (fake_kms_state() && KDUMB_IS_FAKE(md->handle) && kdumb_slot_by_gem(md->handle) >= 0) {
+            md->offset = KDUMB_FAKE_OFF(kdumb_slot_by_gem(md->handle));
+            ret=0;
+        } else {
+            ret=real_ioctl(fd,request,arg);
+            if (ret==0) kdumb_note_map(fd, md->handle, md->offset);
+        }
+    } else if (nr==0xb4 && fake_kms_state() && KDUMB_IS_FAKE(((struct drm_mode_destroy_dumb *)arg)->handle)) {
+        kdumb_destroy_memfd(((struct drm_mode_destroy_dumb *)arg)->handle);   /* DESTROY_DUMB */
+        ret=0;
+    } else if (fake_kms_state() && (nr==0xa4||nr==0xa5||nr==0xab||nr==0xa3||nr==0xbb)) {
+        /* Master-gated legacy state ioctls KWin's legacy path issues:
+         * GETGAMMA/SETGAMMA (0xa4/0xa5), connector SETPROPERTY (0xab),
+         * CURSOR/CURSOR2 (0xa3/0xbb). The Android composer owns master, so
+         * the real calls return EACCES and KWin treats that as a fatal
+         * config error. Try the real ioctl (harmless if it works), then
+         * pretend success -- gamma/cursor/props have no effect on the
+         * HWC2-presented output anyway (kwin renders sw cursors when the
+         * cursor plane is unusable).
+         *
+         * KWin-only (LIBDRM_HYBRIS_FAKE_KMS_STATE): phoc/wlroots issues some of
+         * these (SETPROPERTY/CURSOR) during atomic output bring-up and must see
+         * the real result, or the DRM output never comes up and phosh goes
+         * black. Gated so only the legacy-KMS KWin session opts in. */
+        ret=real_ioctl(fd,request,arg);
+        if (ret!=0) ret=0;
     } else { ret=real_ioctl(fd,request,arg); }
     in_hook=0; return ret;
 }
