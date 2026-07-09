@@ -1120,6 +1120,67 @@ static uint32_t find_gem_by_fb(uint32_t fb_id) {
     return 0;
 }
 
+void drm_shim_panel_power(int on);   /* defined below */
+/* Legacy DPMS: KWin (legacy KMS, KWIN_DRM_NO_AMS) signals panel power by setting
+ * the connector "DPMS" property, which needs DRM master (HWC2 owns it) and
+ * returns EACCES -> the panel never blanks (lit black screen when locked/idle).
+ * Intercept it and drive the HWC2 backlight via drm_shim_panel_power() instead.
+ * Env-gated (LIBDRM_HYBRIS_DPMS_FROM_ACTIVE, the KWin session) so phoc/mutter
+ * are untouched. DPMS values: 0=On, 3=Off. */
+int drmModeConnectorSetProperty(int fd, uint32_t connector_id, uint32_t property_id, uint64_t value) {
+    typedef int (*fn_t)(int,uint32_t,uint32_t,uint64_t);
+    fn_t real=(fn_t)resolve_next("drmModeConnectorSetProperty",(void*)drmModeConnectorSetProperty);
+    static int drive = -1;
+    if (drive < 0) drive = getenv("LIBDRM_HYBRIS_DPMS_FROM_ACTIVE") ? 1 : 0;
+    if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+        fprintf(stderr, "libdrm-hybris: ConnectorSetProperty conn=%u prop=%u val=%llu drive=%d comp=%d\n",
+                connector_id, property_id, (unsigned long long)value, drive, is_compositor());
+    if (drive && is_compositor() && !is_gnome() && g_drm_fd < 0) g_drm_fd = fd;
+    if (drive && is_compositor() && !is_gnome()) {
+        int sv = in_hook; in_hook = 1;
+        drmModePropertyPtr p = drmModeGetProperty(fd, property_id);
+        int is_dpms = (p && strcmp(p->name, "DPMS") == 0);
+        if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+            fprintf(stderr, "libdrm-hybris:   prop name=[%s] is_dpms=%d\n", p ? p->name : "(null)", is_dpms);
+        if (p) drmModeFreeProperty(p);
+        in_hook = sv;
+        if (is_dpms) {
+            drm_shim_panel_power(value == 0 ? 1 : 0);   /* 0=On -> panel on */
+            if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+                fprintf(stderr, "libdrm-hybris: DPMS property -> %llu (panel %s)\n",
+                        (unsigned long long)value, value == 0 ? "ON" : "OFF");
+            return 0;
+        }
+    }
+    return real ? real(fd,connector_id,property_id,value) : -ENOSYS;
+}
+
+/* KWin 6 sets DPMS via the object-property API (its log says "object ID: N"),
+ * not the connector-specific one. Same treatment. */
+int drmModeObjectSetProperty(int fd, uint32_t object_id, uint32_t object_type,
+                             uint32_t property_id, uint64_t value) {
+    typedef int (*fn_t)(int,uint32_t,uint32_t,uint32_t,uint64_t);
+    fn_t real=(fn_t)resolve_next("drmModeObjectSetProperty",(void*)drmModeObjectSetProperty);
+    static int drive = -1;
+    if (drive < 0) drive = getenv("LIBDRM_HYBRIS_DPMS_FROM_ACTIVE") ? 1 : 0;
+    if (drive && is_compositor() && !is_gnome()) {
+        if (g_drm_fd < 0) g_drm_fd = fd;
+        int sv = in_hook; in_hook = 1;
+        drmModePropertyPtr p = drmModeGetProperty(fd, property_id);
+        int is_dpms = (p && strcmp(p->name, "DPMS") == 0);
+        if (p) drmModeFreeProperty(p);
+        in_hook = sv;
+        if (is_dpms) {
+            drm_shim_panel_power(value == 0 ? 1 : 0);
+            if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+                fprintf(stderr, "libdrm-hybris: DPMS(obj) -> %llu (panel %s)\n",
+                        (unsigned long long)value, value == 0 ? "ON" : "OFF");
+            return 0;
+        }
+    }
+    return real ? real(fd,object_id,object_type,property_id,value) : -ENOSYS;
+}
+
 int drmModeAddFB2WithModifiers(int fd, uint32_t w, uint32_t h, uint32_t fmt,
     const uint32_t handles[4], const uint32_t pitches[4], const uint32_t offsets[4],
     const uint64_t mod[4], uint32_t *buf_id, uint32_t flags) {
@@ -1402,11 +1463,19 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReqPtr req, uint32_t flags, void *u
         fprintf(stderr, "libdrm-hybris: atomicCommit #%lu flags=0x%x fb=%u h=%p arm=%d\n",
                 g_commit_n, flags, g_committed_fb, (void*)h, (flags & DRM_MODE_PAGE_FLIP_EVENT)?1:0);
     /* DPMS is driven by phoc's output-power handler via drm_shim_panel_power()
-     * (which keeps the wlr output enabled -> no modeset -> no freeze). We do NOT
-     * also toggle power from the CRTC ACTIVE property here: with the output kept
-     * enabled, ACTIVE stays 1 every commit and would immediately undo a
-     * panel-off, oscillating the backlight. (g_pending_active is left tracked
-     * but unused as a harmless fallback hook.) */
+     * (which keeps the wlr output enabled -> no modeset -> no freeze). phoc
+     * calls that directly; KWin does not -- it signals DPMS only through the
+     * CRTC ACTIVE property. So for the KWin session (env-gated), drive the
+     * panel power from ACTIVE. Safe here (unlike phoc): once the output is off
+     * KWin stops committing frames, so ACTIVE=1 never immediately undoes a
+     * panel-off, and there is no backlight oscillation. */
+    {
+        static int dpms_from_active = -1;
+        if (dpms_from_active < 0)
+            dpms_from_active = getenv("LIBDRM_HYBRIS_DPMS_FROM_ACTIVE") ? 1 : 0;
+        if (dpms_from_active && g_pending_active >= 0)
+            drm_shim_panel_power(g_pending_active);
+    }
     g_pending_active = -1;
     if (h) {
         /* copy_to_dumb (per-frame CPU read of the render buffer) was needed on
