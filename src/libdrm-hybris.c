@@ -1197,6 +1197,29 @@ int drmModeAddFB2WithModifiers(int fd, uint32_t w, uint32_t h, uint32_t fmt,
     if (getenv("LIBDRM_HYBRIS_SAMPLE")) fprintf(stderr,"libdrm-hybris: AddFB2Mod fb=%u handle0=%u\n",id,handles[0]);
     return 0;
 }
+/* Legacy AddFB. KWin's legacy DRM path (KWIN_DRM_NO_AMS) registers its scanout
+ * buffer with this rather than AddFB2, and without an interposer it reaches the
+ * real driver and comes back with a real fb id. That id is not in our map, so
+ * every page flip resolves to no gralloc buffer: nothing is presented (black
+ * screen) and, with no completion, the repaint loop stalls after a frame or
+ * two. Hand out a fake id and record the handle exactly as AddFB2 does. */
+int drmModeAddFB(int fd, uint32_t w, uint32_t h, uint8_t depth, uint8_t bpp,
+                 uint32_t pitch, uint32_t bo_handle, uint32_t *buf_id) {
+    TRACEALL("drmModeAddFB");
+    if (!is_compositor() || !fake_kms_state()) {
+        typedef int (*fn_t)(int,uint32_t,uint32_t,uint8_t,uint8_t,uint32_t,uint32_t,uint32_t*);
+        fn_t real=(fn_t)resolve_next("drmModeAddFB",(void*)drmModeAddFB);
+        return real ? real(fd,w,h,depth,bpp,pitch,bo_handle,buf_id) : -ENOSYS;
+    }
+    if (!frame_w) { frame_w=w; frame_h=h; }
+    if (!dumb_map) init_dumb(fd);
+    uint32_t id=next_fake++; if (buf_id) *buf_id=id; fmap_insert(bo_handle,id);
+    if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+        fprintf(stderr, "libdrm-hybris: AddFB fb=%u handle=%u pitch=%u %ux%u bpp=%u\n",
+                id, bo_handle, pitch, w, h, bpp);
+    return 0;
+}
+
 int drmModeAddFB2(int fd, uint32_t w, uint32_t h, uint32_t fmt,
     const uint32_t handles[4], const uint32_t pitches[4], const uint32_t offsets[4],
     uint32_t *buf_id, uint32_t flags) {
@@ -1533,7 +1556,16 @@ int ioctl(int fd, unsigned long request, ...) {
     uint32_t nr=request&0xff;
     in_hook=1; int ret;
     TRACEALL("ioctl nr=0x%02x", nr);
-    if (nr==0xb8) {
+    if (nr==0xae && fake_kms_state()) {     /* ADDFB (legacy): fake the id, record the handle */
+        struct drm_mode_fb_cmd *c=arg;
+        if (!frame_w) { frame_w=c->width; frame_h=c->height; }
+        if (!dumb_map) init_dumb(fd);
+        uint32_t id=next_fake++; c->fb_id=id; fmap_insert(c->handle,id);
+        if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+            fprintf(stderr, "libdrm-hybris: ioctl AddFB fb=%u handle=%u %ux%u\n",
+                    id, c->handle, c->width, c->height);
+        ret=0;
+    } else if (nr==0xb8) {
         uint32_t *fb=arg, w=fb[0], h=fb[1], gem=fb[5];
         if (!frame_w) { frame_w=w; frame_h=h; }
         if (!dumb_map) init_dumb(fd);
@@ -1576,7 +1608,15 @@ int ioctl(int fd, unsigned long request, ...) {
             }
         }
         if (h) { copy_to_dumb(h); present_hwc2(h); }
-        else present_qpainter_dumb(find_gem_by_fb(flip->fb_id));  /* KWin QPainter dumb buffer */
+        else {
+            if (getenv("LIBDRM_HYBRIS_SAMPLE")) {
+                static unsigned long miss = 0;
+                if (miss++ < 8)
+                    fprintf(stderr, "libdrm-hybris: flip fb=%u UNRESOLVED gem=%u fmap_n=%d gmap_n=%d\n",
+                            flip->fb_id, find_gem_by_fb(flip->fb_id), fmap_n, gmap_n);
+            }
+            present_qpainter_dumb(find_gem_by_fb(flip->fb_id));  /* KWin QPainter dumb buffer */
+        }
         if (dumb_fb_id) flip->fb_id=dumb_fb_id;
         ret=real_ioctl(fd,request,arg);
         /* Arm regardless of the real result: phoc's flip returns EACCES (as
