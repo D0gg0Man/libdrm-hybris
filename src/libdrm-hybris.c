@@ -553,6 +553,12 @@ static void synth_arm(uint32_t crtc, uint64_t user_data) {
     }
     g_synth_qn++;
     g_synth_active = 1;
+    if (getenv("LIBDRM_HYBRIS_SAMPLE")) {
+        static unsigned long a = 0;
+        if (a++ < 10)
+            fprintf(stderr, "libdrm-hybris: synth_arm #%lu crtc=%u qn=%d timer=%d wake=%d\n",
+                    a, crtc, g_synth_qn, g_timer_fd, g_wake_fd);
+    }
     /* Kick the wake eventfd so the compositor's (possibly idle) outer event loop
      * wakes and drills into the DRM epoll to consume this flip. Drained+hidden in
      * epoll_synth() so the compositor never sees the eventfd itself. */
@@ -582,6 +588,11 @@ ssize_t read(int fd, void *buf, size_t count) {
     ev.tv_sec  = (uint32_t)(n / 1000000000ull);
     ev.tv_usec = (uint32_t)((n / 1000ull) % 1000000ull);
     ev.sequence = ++g_synth_seq;
+    if (getenv("LIBDRM_HYBRIS_SAMPLE")) {
+        static unsigned long d = 0;
+        if (d++ < 10)
+            fprintf(stderr, "libdrm-hybris: synth deliver #%lu seq=%u\n", d, g_synth_seq);
+    }
     ev.crtc_id  = g_synth_q[g_synth_qh].crtc;
     memcpy(buf, &ev, sizeof ev);
     g_synth_qh = (g_synth_qh + 1) % SYNTH_QMAX;
@@ -1318,6 +1329,12 @@ int drmModePageFlip(int fd, uint32_t crtc_id, uint32_t fb_id, uint32_t flags, vo
         return real ? real(fd,crtc_id,fb_id,flags,ud) : -ENOSYS;
     g_drm_fd = fd; synth_note_flip();
     buffer_handle_t h=find_by_fb(fb_id);
+    if (getenv("LIBDRM_HYBRIS_SAMPLE")) {
+        static unsigned long fn = 0;
+        if (fn++ < 12)
+            fprintf(stderr, "libdrm-hybris: PageFlip fb=%u gem=%u gralloc=%p fmap_n=%d gmap_n=%d\n",
+                    fb_id, find_gem_by_fb(fb_id), (void*)h, fmap_n, gmap_n);
+    }
     if (h) { copy_to_dumb(h); present_hwc2(h); }
     else present_qpainter_dumb(find_gem_by_fb(fb_id));  /* KWin QPainter dumb buffer */
     /* Drive the real ioctl exactly as before -- it re-enters our raw-ioctl hook
