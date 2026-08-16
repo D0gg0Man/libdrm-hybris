@@ -24,6 +24,8 @@
 #include <stdint.h>
 #include <errno.h>
 #include <dlfcn.h>
+#include <pthread.h>
+#include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <stdarg.h>
@@ -328,6 +330,8 @@ struct wl_display *wl_display_create(void) {
 }
 
 
+extern void *g_hwc_display;
+
 /* ==========================================================================
  * 5. HWC2 VSYNC -- always succeed so schedule_frame() keeps running
  * ========================================================================== */
@@ -508,7 +512,97 @@ void drm_shim_set_vsync_period(uint64_t ns) {
  * presents periodically straddle the composer's latch point -> mixed old/new
  * frames = flicker under motion (session-random severity = boot phase). */
 static uint64_t g_vsync_stamp_ns = 0;
-void drm_shim_vsync_stamp(int64_t ts) { if (ts > 0) g_vsync_stamp_ns = (uint64_t)ts; }
+static unsigned long g_vsync_stamps = 0;
+void drm_shim_vsync_stamp(int64_t ts) { if (ts > 0) { g_vsync_stamp_ns = (uint64_t)ts; g_vsync_stamps++; } }
+
+/* Recover the panel's vblank PHASE without HWC2 vsync callbacks.
+ *
+ * Measured on-device: this HAL never fires the vsync callback (stamps stayed 0
+ * over minutes of compositing), so drm_shim_vsync_stamp() was never called and
+ * BOTH synth_arm()'s flip deadlines and the flip-event presentation timestamps
+ * silently fell back to free-running now(). The period was always correct
+ * (8333333 ns); only the phase was missing, and a free-running flip clock
+ * drifts against the panel exactly as the synth_arm comment warns.
+ *
+ * hwc2_compat_display_present() returns a fence that signals at the vblank the
+ * frame was scanned out; drmadapter closes it immediately. Interpose the call
+ * (this shim is in ld.so.preload, so it wins), dup the fd so drmadapter's close
+ * stays harmless, and read the PREVIOUS frame's signal time via
+ * SYNC_IOC_FILE_INFO -- signalled by then, so nothing blocks.
+ *
+ * Resolution must NEVER fail closed: returning an error fails every present and
+ * blanks the panel (learned the hard way). Try RTLD_NEXT, then dlopen libhwc2,
+ * and only then give up -- reporting success with no fence rather than error. */
+struct dh_sync_fence_info {
+    char obj_name[32]; char driver_name[32];
+    int32_t status; uint32_t flags; uint64_t timestamp_ns;
+};
+struct dh_sync_file_info {
+    char name[32]; int32_t status; uint32_t flags;
+    uint32_t num_fences; uint32_t pad; uint64_t sync_fence_info;
+};
+#define DH_SYNC_IOC_FILE_INFO _IOWR('>', 4, struct dh_sync_file_info)
+
+typedef int (*hwc2_present_fn)(void*, int32_t*);
+int hwc2_compat_display_present(void *display, int32_t *out_fence);
+
+static hwc2_present_fn hwc2_present_real(void) {
+    static hwc2_present_fn f = NULL;
+    static int tried = 0;
+    if (tried) return f;
+    tried = 1;
+    f = (hwc2_present_fn)resolve_next("hwc2_compat_display_present",
+                                      (void*)hwc2_compat_display_present);
+    if (!f) {
+        const char *cands[] = { "libhwc2.so.1", "libhwc2.so", NULL };
+        for (int i = 0; cands[i] && !f; i++) {
+            void *h = dlopen(cands[i], RTLD_NOW | RTLD_GLOBAL);
+            if (!h) continue;
+            void *sym = dlsym(h, "hwc2_compat_display_present");
+            if (sym && sym != (void*)hwc2_compat_display_present)
+                f = (hwc2_present_fn)sym;
+        }
+    }
+    fprintf(stderr, "libdrm-hybris: hwc2 present real=%p (%s)\n",
+            (void*)f, f ? "resolved" : "NOT RESOLVED - fence phase off");
+    return f;
+}
+
+static void stamp_phase_from_fence(int fd) {
+    if (fd < 0 || !real_ioctl) return;
+    struct dh_sync_file_info info; memset(&info, 0, sizeof info);
+    int saved = in_hook; in_hook = 1;
+    if (real_ioctl(fd, DH_SYNC_IOC_FILE_INFO, &info) == 0 && info.num_fences) {
+        struct dh_sync_fence_info *fi = calloc(info.num_fences, sizeof(*fi));
+        if (fi) {
+            info.sync_fence_info = (uint64_t)(uintptr_t)fi;
+            if (real_ioctl(fd, DH_SYNC_IOC_FILE_INFO, &info) == 0) {
+                uint64_t latest = 0;
+                for (uint32_t i = 0; i < info.num_fences; i++)
+                    if (fi[i].status == 1 && fi[i].timestamp_ns > latest)
+                        latest = fi[i].timestamp_ns;
+                if (latest) { g_vsync_stamp_ns = latest; g_vsync_stamps++; }
+            }
+            free(fi);
+        }
+    }
+    in_hook = saved;
+}
+
+int hwc2_compat_display_present(void *display, int32_t *out_fence) {
+    g_hwc_display = display;   /* needed by drm_shim_panel_power() below */
+    hwc2_present_fn real = hwc2_present_real();
+    if (!real) { if (out_fence) *out_fence = -1; return 0; }  /* fail OPEN */
+    int r = real(display, out_fence);
+    static int off = -1;
+    if (off < 0) off = getenv("LIBDRM_HYBRIS_NO_FENCE_PHASE") ? 1 : 0;
+    if (!off && out_fence && *out_fence >= 0) {
+        static int prev = -1;
+        if (prev >= 0) { stamp_phase_from_fence(prev); close(prev); }
+        prev = dup(*out_fence);
+    }
+    return r;
+}
 /* KWin's legacy-KMS path wants master-gated state ioctls (gamma/cursor/property)
  * faked to success; wlroots/phoc needs their real result during atomic output
  * bring-up. Opt-in so only the KWin session changes behaviour. */
@@ -585,8 +679,33 @@ ssize_t read(int fd, void *buf, size_t count) {
     ev.base.length = sizeof ev;
     ev.user_data   = g_synth_q[g_synth_qh].user;
     uint64_t n = now_ns();
-    ev.tv_sec  = (uint32_t)(n / 1000000000ull);
-    ev.tv_usec = (uint32_t)((n / 1000ull) % 1000000ull);
+    /* The presentation timestamp mutter's frame clock schedules against must be
+     * the vblank the frame was shown at, NOT the moment its main loop got round
+     * to read()ing the event. Feeding it read() jitter makes it mispredict the
+     * next deadline and miss it, which shows up as a bimodal 8.3/16.6 ms frame
+     * interval with the GPU and CPU both idle. Snap to the last real panel
+     * vblank boundary (HWC2 stamps g_vsync_stamp_ns) when we have a fresh
+     * reference. LIBDRM_HYBRIS_RAW_TS=1 restores the old now()-based stamp. */
+    uint64_t ts = n;
+    int aligned = 0;
+    {
+        static int raw = -1;
+        if (raw < 0) raw = getenv("LIBDRM_HYBRIS_RAW_TS") ? 1 : 0;
+        if (!raw && g_vsync_stamp_ns && g_vsync_ns && n > g_vsync_stamp_ns &&
+            n - g_vsync_stamp_ns < 1000000000ull)
+            ts = g_vsync_stamp_ns + ((n - g_vsync_stamp_ns) / g_vsync_ns) * g_vsync_ns;
+            aligned = 1;
+    }
+    if (getenv("LIBDRM_HYBRIS_SYNCSTATS")) {
+        static unsigned long e = 0;
+        if ((e++ % 120) == 0)
+            fprintf(stderr, "libdrm-hybris: phase stamps=%lu  age=%lld us  aligned=%d  period=%llu ns\n",
+                    g_vsync_stamps,
+                    g_vsync_stamp_ns ? (long long)((n - g_vsync_stamp_ns)/1000) : -1LL,
+                    aligned, (unsigned long long)g_vsync_ns);
+    }
+    ev.tv_sec  = (uint32_t)(ts / 1000000000ull);
+    ev.tv_usec = (uint32_t)((ts / 1000ull) % 1000000ull);
     ev.sequence = ++g_synth_seq;
     if (getenv("LIBDRM_HYBRIS_SAMPLE")) {
         static unsigned long d = 0;
@@ -821,6 +940,7 @@ void drm_shim_set_present_cpu(int (*fn)(const void *, uint32_t)) {
  * output-disable commit powers the panel down and the re-enable commit (driven
  * by phosh on wake input) powers it back up. */
 static void (*g_power_fn)(int) = NULL;
+void *g_hwc_display = NULL;   /* captured in hwc2_compat_display_present() */
 void drm_shim_set_power(void (*fn)(int)) {
     g_power_fn = fn;
     if (getenv("LIBDRM_HYBRIS_SAMPLE")) fprintf(stderr, "libdrm-hybris: power callback registered fn=%p\n", (void*)fn);
@@ -888,15 +1008,84 @@ static void sample_all_buffers(void) {
         if (nz) fprintf(stderr, "libdrm-hybris:   buffer[%d] gralloc=%p NONBLACK samples=%lu\n", i, (void*)h, nz);
     }
 }
+static unsigned long g_lockfail = 0;
+static void syncstat(long lock_us, long body_us, long unlock_us) {
+    static int on = -1;
+    if (on < 0) on = getenv("LIBDRM_HYBRIS_SYNCSTATS") ? 1 : 0;
+    if (!on) return;
+    static unsigned long n = 0, tl = 0, tb = 0, tu = 0; static long mx = 0;
+    long tot = lock_us + body_us + unlock_us;
+    n++; tl += lock_us; tb += body_us; tu += unlock_us; if (tot > mx) mx = tot;
+    if ((n % 120) == 0) {
+        fprintf(stderr, "libdrm-hybris: sync %lu frames  lock %lu us  body %lu us  unlock %lu us  total %lu us (max %ld)  lockfail=%lu\n",
+                n, tl/n, tb/n, tu/n, (tl+tb+tu)/n, mx, g_lockfail);
+        mx = 0;
+    }
+}
+/* Frame pacing histogram: interval between successive syncs, bucketed against
+ * the 8.33 ms (120 Hz) period. Distinguishes jitter from a low average rate. */
+static void pacestat(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("LIBDRM_HYBRIS_SYNCSTATS") ? 1 : 0;
+    if (!on) return;
+    static uint64_t prev = 0;
+    static unsigned long n = 0, b[6];
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    uint64_t now = (uint64_t)t.tv_sec*1000000000ull + t.tv_nsec;
+    if (prev) {
+        uint64_t d = (now - prev) / 1000;
+        int i = d < 6000 ? 0 : d < 10000 ? 1 : d < 14000 ? 2
+              : d < 20000 ? 3 : d < 40000 ? 4 : 5;
+        b[i]++; n++;
+        if ((n % 120) == 0)
+            fprintf(stderr, "libdrm-hybris: pace <6ms:%lu  6-10(120Hz):%lu  10-14:%lu  14-20(60Hz):%lu  20-40:%lu  >40ms:%lu\n",
+                    b[0],b[1],b[2],b[3],b[4],b[5]);
+    }
+    prev = now;
+}
+/* The dumb buffer is never scanned out; this exists only to make the Mali GPU
+ * resolve its render before HWC2 presents. Measured on-device: lock 94 us,
+ * unlock 23 us, full-buffer memcpy body 31000 us -- the traversal was ~100% of
+ * the cost and capped the compositor near 30 fps. The lock is what forces the
+ * resolve, not the traversal: touching one cache line every ROWSTEP rows gives
+ * the same result for ~450 us (69x). LIBDRM_HYBRIS_SYNC=touch selects it. */
+static int sync_mode_touch(void) {
+    static int m = -1;
+    if (m < 0) { const char *e = getenv("LIBDRM_HYBRIS_SYNC"); m = (e && !strcmp(e,"touch")) ? 1 : 0; }
+    return m;
+}
 static void copy_to_dumb(buffer_handle_t h) {
     if (!dumb_map || !h || !frame_w || !frame_h) return;
+    pacestat();
+    struct timespec t0, t1, t2, t3;
     void *src = NULL;
-    if (hybris_gralloc_lock(h, 0x3|0x30, 0, 0, frame_w, frame_h, &src) || !src) return;
+    const int touch = sync_mode_touch();
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int lr = hybris_gralloc_lock(h, 0x3|0x30, 0, 0, frame_w, frame_h, &src);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (lr || !src) {
+        g_lockfail++;
+        if ((g_lockfail % 60) == 1)
+            fprintf(stderr, "libdrm-hybris: gralloc_lock FAILED rc=%d src=%p count=%lu\n", lr, src, g_lockfail);
+        return;
+    }
     uint8_t *d = dumb_map, *s = src;
+    if (touch) {
+        static int rowstep = -1;
+        if (rowstep < 0) { const char *e = getenv("LIBDRM_HYBRIS_ROWSTEP"); rowstep = e ? atoi(e) : 1; if (rowstep < 1) rowstep = 1; }
+        volatile uint32_t acc = 0;
+        for (uint32_t y = 0; y < frame_h; y += (uint32_t)rowstep) {
+            const uint32_t *row = (const uint32_t *)(s + (size_t)y * dumb_pitch);
+            for (uint32_t x = 0; x < frame_w; x += 16) acc ^= row[x];
+        }
+        (void)acc;
+    } else {
     /* The full-frame read here is load-bearing: touching every pixel forces the
      * Mali GPU to resolve its render into the buffer before it's presented. */
     for (uint32_t y = 0; y < frame_h; y++)
         memcpy(d + y*dumb_pitch, s + y*dumb_pitch, frame_w*4);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t2);
     /* Diagnostic: is the committed buffer actually non-black? Sample a grid. */
     if (getenv("LIBDRM_HYBRIS_SAMPLE")) {
         unsigned long nz = 0; uint32_t cx = frame_w/2, cy = frame_h/2;
@@ -910,6 +1099,10 @@ static void copy_to_dumb(buffer_handle_t h) {
                 g_commit_n, (void*)h, nz, c[0], c[1], c[2]);
     }
     hybris_gralloc_unlock(h);
+    clock_gettime(CLOCK_MONOTONIC, &t3);
+    syncstat((t1.tv_sec-t0.tv_sec)*1000000 + (t1.tv_nsec-t0.tv_nsec)/1000,
+             (t2.tv_sec-t1.tv_sec)*1000000 + (t2.tv_nsec-t1.tv_nsec)/1000,
+             (t3.tv_sec-t2.tv_sec)*1000000 + (t3.tv_nsec-t2.tv_nsec)/1000);
 }
 static int init_dumb(int fd) {
     if (dumb_map) return 0;
@@ -1311,6 +1504,16 @@ int drmModeSetCrtc(int fd, uint32_t crtcId, uint32_t bufferId, uint32_t x, uint3
         return real ? real(fd,crtcId,bufferId,x,y,connectors,count,mode) : -ENOSYS;
     }
     if (!dumb_map) init_dumb(fd);
+
+    /* mutter blanks by calling meta_kms_device_disable(), which on the legacy
+     * KMS path (MUTTER_DEBUG_FORCE_KMS_MODE=simple, as the gnome-mali session
+     * sets) arrives here as a CRTC disable: no fb, no connectors, no mode.
+     * Those DRM calls are swallowed below, so nothing ever reached the panel --
+     * the backlight went to 0 while the DSI panel and the MediaTek display
+     * pipeline kept clocking (~60 mtk_cmdq interrupts/sec with the screen
+     * dark). mutter never emits an atomic ACTIVE commit here and never touches
+     * the DPMS property, so neither of the existing paths could fire.
+     * Translate the disable/enable into HWC2 panel power directly. */
     /* KWin's QPainter backend presents its very first frame via a modeset, then
      * page-flips. Present that first dumb buffer too so the panel isn't blank
      * until the first flip. Only fires for tracked dumb buffers (gralloc paths
@@ -1438,12 +1641,79 @@ static int g_output_on = 1;          /* current panel power state (init: on) */
  * wlroots stops scheduling frames for client damage on this faked-KMS backend
  * (the screen freezes). Keeping the output enabled and only toggling HWC2 panel
  * power avoids the modeset entirely. */
+/* mutter's blank never reaches the panel on this backend: it calls
+ * meta_kms_device_disable(), whose DRM traffic is swallowed here, and with
+ * MUTTER_DEBUG_FORCE_KMS_MODE=simple it emits neither an atomic ACTIVE commit
+ * nor a DPMS property set nor a legacy CRTC disable -- all three existing
+ * detection paths were checked on device and none fire. Rather than keep
+ * guessing which ioctl carries it, take the signal from the one place that is
+ * unambiguous: gnome-shell's powerManager, which writes this file in
+ * _turnOffScreen()/_turnOnScreen(). Values are HWC2-ish: 0 = off, 1 = on. */
+static void *panel_ctl_thread(void *unused) {
+    (void)unused;
+    char path[128];
+    snprintf(path, sizeof path, "/run/user/%u/hybris-display-power",
+             (unsigned)getuid());
+    time_t last = 0;
+    for (;;) {
+        struct stat st;
+        if (stat(path, &st) == 0 && st.st_mtime != last) {
+            last = st.st_mtime;
+            FILE *f = fopen(path, "r");
+            if (f) {
+                int v = -1;
+                if (fscanf(f, "%d", &v) == 1 && (v == 0 || v == 1))
+                    drm_shim_panel_power(v);
+                fclose(f);
+            }
+        }
+        usleep(200000);
+    }
+    return NULL;
+}
+
+__attribute__((constructor))
+static void panel_ctl_start(void) {
+    if (!getenv("LIBDRM_HYBRIS_PANEL_CTL")) return;
+    /* Only the compositor holds an HWC2 display handle. Without this gate every
+     * hybris client that inherits the session env (thumbnailers especially --
+     * 1125 of them in one boot) spawns a polling thread that can only ever call
+     * setPowerMode with a NULL handle. A battery fix should not ship idle
+     * pollers in every process on the system. */
+    if (!is_compositor()) return;
+    pthread_t t;
+    if (pthread_create(&t, NULL, panel_ctl_thread, NULL) == 0)
+        pthread_detach(t);
+}
+
 void drm_shim_panel_power(int on) {
     on = on ? 1 : 0;
     if (on == g_output_on) return;
     g_output_on = on;
-    if (g_power_fn) g_power_fn(on);
-    fprintf(stderr, "libdrm-hybris: drm_shim_panel_power -> %s\n", on ? "ON" : "OFF");
+    if (g_power_fn) {
+        g_power_fn(on);
+    } else {
+        /* Under GNOME nothing calls drm_shim_set_power(), so g_power_fn stays
+         * NULL and the panel never powered down -- the backlight went to 0 but
+         * the DSI panel and the MediaTek display pipeline kept clocking all
+         * night (~60 mtk_cmdq interrupts/sec with the screen dark). phoc
+         * registers a callback; mutter has no equivalent, so drive the HAL
+         * ourselves. libhwc2.so exports this; HWC2 power modes: 0=OFF, 2=ON. */
+        static hwc2_error_t (*set_pm)(void *, int32_t) = NULL;
+        static int resolved = 0;
+        if (!resolved) {
+            set_pm = resolve_next("hwc2_compat_display_set_power_mode", NULL);
+            if (!set_pm) set_pm = dlsym(RTLD_DEFAULT, "hwc2_compat_display_set_power_mode");
+            resolved = 1;
+            if (getenv("LIBDRM_HYBRIS_PANEL_CTL_DEBUG"))
+                fprintf(stderr, "libdrm-hybris: panel power fallback fn=%p display=%p\n",
+                        (void *)set_pm, g_hwc_display);
+        }
+        if (set_pm && g_hwc_display)
+            set_pm(g_hwc_display, on ? 2 : 0);
+    }
+    if (getenv("LIBDRM_HYBRIS_PANEL_CTL_DEBUG"))
+        fprintf(stderr, "libdrm-hybris: drm_shim_panel_power -> %s\n", on ? "ON" : "OFF");
 }
 /* phoc queries this on input activity: if the panel was blanked, phoc forces it
  * back on (and repaints), so ANY input wakes the screen even when phosh's
