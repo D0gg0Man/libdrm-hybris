@@ -101,7 +101,8 @@ extern HYBRIS_INTERNAL struct hybris_tuning hybris_tuning;
  * Previously ~60 loose file-static variables. Grouped by lifetime and owner so
  * it is clear what belongs together and what each module may touch. */
 
-#define HYBRIS_MAX_BUFFERS 256
+/* Matches the original table size; raising it is a behaviour change. */
+#define HYBRIS_MAX_BUFFERS 64
 
 /* gralloc handle <-> DRM identity. Two directions are needed: PRIME fd -> the
  * gralloc buffer it came from, and GEM handle -> the framebuffer id we faked

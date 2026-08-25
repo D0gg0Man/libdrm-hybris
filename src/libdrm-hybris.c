@@ -266,20 +266,10 @@ void HWCNativeBufferSetFence(ANativeWindowBuffer *buffer, int fd) {
  * 7. DRM IOCTLS -- intercept ADDFB2/ATOMIC/PAGE_FLIP; maintain dumb buffer
  * ========================================================================== */
 
-#define MAX 64
 
-static uint32_t frame_w = 0, frame_h = 0;
 
-static struct { uint32_t prime_fd; buffer_handle_t gralloc; } gmap[MAX];
-static int gmap_n = 0;
 
-static struct { uint32_t gem, fb_id; } fmap[MAX];
-static int fmap_n = 0;
 
-static uint32_t  dumb_handle = 0, dumb_fb_id = 0, dumb_pitch = 0;
-static void     *dumb_map    = NULL;
-static size_t    dumb_size   = 0;
-static uint32_t  next_fake   = 0x80000000u;
 static __thread int in_hook  = 0;
 
 typedef int (*ioctl_t)(int, unsigned long, ...);
@@ -785,21 +775,21 @@ int epoll_pwait2(int epfd, struct epoll_event *events, int maxevents, const stru
 
 static int gmap_evict = 0;
 void drm_shim_register_bo(uint32_t prime_fd, buffer_handle_t gralloc) {
-    for (int i = 0; i < gmap_n; i++)
-        if (gmap[i].prime_fd == prime_fd) { gmap[i].gralloc = gralloc; return; }
+    for (int i = 0; i < hybris_buffers.n_by_prime; i++)
+        if (hybris_buffers.by_prime[i].prime_fd == prime_fd) { hybris_buffers.by_prime[i].gralloc = gralloc; return; }
     int slot;
-    if (gmap_n < MAX) slot = gmap_n++;
-    else { slot = gmap_evict; gmap_evict = (gmap_evict + 1) % MAX; }
-    gmap[slot].prime_fd = prime_fd; gmap[slot].gralloc = gralloc;
+    if (hybris_buffers.n_by_prime < HYBRIS_MAX_BUFFERS) slot = hybris_buffers.n_by_prime++;
+    else { slot = gmap_evict; gmap_evict = (gmap_evict + 1) % HYBRIS_MAX_BUFFERS; }
+    hybris_buffers.by_prime[slot].prime_fd = prime_fd; hybris_buffers.by_prime[slot].gralloc = gralloc;
 }
 static buffer_handle_t find_gralloc(uint32_t gem) {
-    for (int i = 0; i < gmap_n; i++)
-        if (gmap[i].prime_fd == gem) return gmap[i].gralloc;
+    for (int i = 0; i < hybris_buffers.n_by_prime; i++)
+        if (hybris_buffers.by_prime[i].prime_fd == gem) return hybris_buffers.by_prime[i].gralloc;
     return NULL;
 }
 static buffer_handle_t find_by_fb(uint32_t fb_id) {
-    for (int i = 0; i < fmap_n; i++)
-        if (fmap[i].fb_id == fb_id) return find_gralloc(fmap[i].gem);
+    for (int i = 0; i < hybris_buffers.n_by_gem; i++)
+        if (hybris_buffers.by_gem[i].fb_id == fb_id) return find_gralloc(hybris_buffers.by_gem[i].gem);
     return NULL;
 }
 /* Exported so libhybris (eglplatformcommon) can recover the gralloc handle
@@ -877,12 +867,12 @@ static void present_hwc2(buffer_handle_t h) {
 }
 static int fmap_evict = 0;
 static void fmap_insert(uint32_t gem, uint32_t fb_id) {
-    for (int i = 0; i < fmap_n; i++)
-        if (fmap[i].gem == gem) { fmap[i].fb_id = fb_id; return; }
+    for (int i = 0; i < hybris_buffers.n_by_gem; i++)
+        if (hybris_buffers.by_gem[i].gem == gem) { hybris_buffers.by_gem[i].fb_id = fb_id; return; }
     int slot;
-    if (fmap_n < MAX) slot = fmap_n++;
-    else { slot = fmap_evict; fmap_evict = (fmap_evict + 1) % MAX; }
-    fmap[slot].gem = gem; fmap[slot].fb_id = fb_id;
+    if (hybris_buffers.n_by_gem < HYBRIS_MAX_BUFFERS) slot = hybris_buffers.n_by_gem++;
+    else { slot = fmap_evict; fmap_evict = (fmap_evict + 1) % HYBRIS_MAX_BUFFERS; }
+    hybris_buffers.by_gem[slot].gem = gem; hybris_buffers.by_gem[slot].fb_id = fb_id;
 }
 /* NB: the dumb buffer is never actually scanned out (the HWC2 composer owns the
  * CRTC; real pixels reach the panel via the drmadapter EGL path). HOWEVER the
@@ -894,16 +884,16 @@ static unsigned long g_commit_n = 0;
 /* Diagnostic: scan every registered gralloc buffer for non-black content, to
  * tell whether the rendered frame landed in a buffer we simply didn't pick. */
 static void sample_all_buffers(void) {
-    if (!frame_w || !frame_h) return;
-    for (int i = 0; i < gmap_n; i++) {
-        buffer_handle_t h = gmap[i].gralloc;
+    if (!hybris_frame.width || !hybris_frame.height) return;
+    for (int i = 0; i < hybris_buffers.n_by_prime; i++) {
+        buffer_handle_t h = hybris_buffers.by_prime[i].gralloc;
         if (!h) continue;
         void *s = NULL;
-        if (hybris_gralloc_lock(h, 0x3, 0, 0, frame_w, frame_h, &s) || !s) continue;
+        if (hybris_gralloc_lock(h, 0x3, 0, 0, hybris_frame.width, hybris_frame.height, &s) || !s) continue;
         unsigned long nz = 0;
-        for (uint32_t y = 0; y < frame_h; y += 64)
-            for (uint32_t x = 0; x < frame_w; x += 64) {
-                uint8_t *p = (uint8_t*)s + (size_t)y*frame_w*4 + x*4;
+        for (uint32_t y = 0; y < hybris_frame.height; y += 64)
+            for (uint32_t x = 0; x < hybris_frame.width; x += 64) {
+                uint8_t *p = (uint8_t*)s + (size_t)y*hybris_frame.width*4 + x*4;
                 if (p[0]|p[1]|p[2]) nz++;
             }
         hybris_gralloc_unlock(h);
@@ -955,13 +945,13 @@ static int sync_mode_touch(void) {
     return hybris_tuning.touch_sync;
 }
 static void copy_to_dumb(buffer_handle_t h) {
-    if (!dumb_map || !h || !frame_w || !frame_h) return;
+    if (!hybris_dumb.map || !h || !hybris_frame.width || !hybris_frame.height) return;
     pacestat();
     struct timespec t0, t1, t2, t3;
     void *src = NULL;
     const int touch = sync_mode_touch();
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    int lr = hybris_gralloc_lock(h, 0x3|0x30, 0, 0, frame_w, frame_h, &src);
+    int lr = hybris_gralloc_lock(h, 0x3|0x30, 0, 0, hybris_frame.width, hybris_frame.height, &src);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     if (lr || !src) {
         g_lockfail++;
@@ -969,32 +959,32 @@ static void copy_to_dumb(buffer_handle_t h) {
             LOG("gralloc_lock FAILED rc=%d src=%p count=%lu", lr, src, g_lockfail);
         return;
     }
-    uint8_t *d = dumb_map, *s = src;
+    uint8_t *d = hybris_dumb.map, *s = src;
     if (touch) {
         static int rowstep = -1;
         if (rowstep < 0) rowstep = hybris_tuning.row_step;
         volatile uint32_t acc = 0;
-        for (uint32_t y = 0; y < frame_h; y += (uint32_t)rowstep) {
-            const uint32_t *row = (const uint32_t *)(s + (size_t)y * dumb_pitch);
-            for (uint32_t x = 0; x < frame_w; x += 16) acc ^= row[x];
+        for (uint32_t y = 0; y < hybris_frame.height; y += (uint32_t)rowstep) {
+            const uint32_t *row = (const uint32_t *)(s + (size_t)y * hybris_dumb.pitch);
+            for (uint32_t x = 0; x < hybris_frame.width; x += 16) acc ^= row[x];
         }
         (void)acc;
     } else {
     /* The full-frame read here is load-bearing: touching every pixel forces the
      * GPU to resolve its render into the buffer before it's presented. */
-    for (uint32_t y = 0; y < frame_h; y++)
-        memcpy(d + y*dumb_pitch, s + y*dumb_pitch, frame_w*4);
+    for (uint32_t y = 0; y < hybris_frame.height; y++)
+        memcpy(d + y*hybris_dumb.pitch, s + y*hybris_dumb.pitch, hybris_frame.width*4);
     }
     clock_gettime(CLOCK_MONOTONIC, &t2);
     /* Diagnostic: is the committed buffer actually non-black? Sample a grid. */
     if (hybris_debug.sample) {
-        unsigned long nz = 0; uint32_t cx = frame_w/2, cy = frame_h/2;
-        for (uint32_t y = 0; y < frame_h; y += 64)
-            for (uint32_t x = 0; x < frame_w; x += 64) {
-                uint8_t *p = s + y*dumb_pitch + x*4;
+        unsigned long nz = 0; uint32_t cx = hybris_frame.width/2, cy = hybris_frame.height/2;
+        for (uint32_t y = 0; y < hybris_frame.height; y += 64)
+            for (uint32_t x = 0; x < hybris_frame.width; x += 64) {
+                uint8_t *p = s + y*hybris_dumb.pitch + x*4;
                 if (p[0]|p[1]|p[2]) nz++;
             }
-        uint8_t *c = s + cy*dumb_pitch + cx*4;
+        uint8_t *c = s + cy*hybris_dumb.pitch + cx*4;
         LOG("commit#%lu h=%p nonblack_samples=%lu center=%02x%02x%02x",
                 g_commit_n, (void*)h, nz, c[0], c[1], c[2]);
     }
@@ -1005,30 +995,30 @@ static void copy_to_dumb(buffer_handle_t h) {
              (t3.tv_sec-t2.tv_sec)*1000000 + (t3.tv_nsec-t2.tv_nsec)/1000);
 }
 static int init_dumb(int fd) {
-    if (dumb_map) return 0;
-    if (!frame_w || !frame_h) return -1;
+    if (hybris_dumb.map) return 0;
+    if (!hybris_frame.width || !hybris_frame.height) return -1;
     int saved = in_hook; in_hook = 1;
-    struct drm_mode_create_dumb cd = { .height=frame_h, .width=frame_w, .bpp=32 };
+    struct drm_mode_create_dumb cd = { .height=hybris_frame.height, .width=hybris_frame.width, .bpp=32 };
     if (real_ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &cd)) { in_hook=saved; return -1; }
-    dumb_handle=cd.handle; dumb_pitch=cd.pitch; dumb_size=cd.size;
+    hybris_dumb.handle=cd.handle; hybris_dumb.pitch=cd.pitch; hybris_dumb.size=cd.size;
     struct drm_mode_fb_cmd fb = {
-        .width=frame_w, .height=frame_h,
-        .pitch=dumb_pitch, .bpp=32, .depth=24, .handle=dumb_handle
+        .width=hybris_frame.width, .height=hybris_frame.height,
+        .pitch=hybris_dumb.pitch, .bpp=32, .depth=24, .handle=hybris_dumb.handle
     };
     if (real_ioctl(fd, DRM_IOCTL_MODE_ADDFB, &fb) == 0) {
-        dumb_fb_id = fb.fb_id;
+        hybris_dumb.fb_id = fb.fb_id;
     } else {
         struct drm_mode_fb_cmd2 fb2 = {
-            .width=frame_w, .height=frame_h, .pixel_format=0x34325258
+            .width=hybris_frame.width, .height=hybris_frame.height, .pixel_format=0x34325258
         };
-        fb2.handles[0]=dumb_handle; fb2.pitches[0]=dumb_pitch;
+        fb2.handles[0]=hybris_dumb.handle; fb2.pitches[0]=hybris_dumb.pitch;
         if (real_ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &fb2)) { in_hook=saved; return -1; }
-        dumb_fb_id = fb2.fb_id;
+        hybris_dumb.fb_id = fb2.fb_id;
     }
-    struct drm_mode_map_dumb md = { .handle=dumb_handle };
+    struct drm_mode_map_dumb md = { .handle=hybris_dumb.handle };
     if (real_ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &md)) { in_hook=saved; return -1; }
-    dumb_map = mmap(NULL, dumb_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, md.offset);
-    if (dumb_map == MAP_FAILED) { dumb_map=NULL; in_hook=saved; return -1; }
+    hybris_dumb.map = mmap(NULL, hybris_dumb.size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, md.offset);
+    if (hybris_dumb.map == MAP_FAILED) { hybris_dumb.map=NULL; in_hook=saved; return -1; }
     in_hook=saved; return 0;
 }
 
@@ -1144,11 +1134,11 @@ static void kdumb_note_map(int fd, uint32_t gem, uint64_t offset) {
  * then builds the scanout FB from that fd's handle, so the flipped fb's "gem"
  * is the exported fd, not the CREATE_DUMB handle. Map fd -> dumb gem so we can
  * still find the CPU mapping. */
-static struct { int fd; uint32_t dumb_gem; } primemap[MAX];
+static struct { int fd; uint32_t dumb_gem; } primemap[HYBRIS_MAX_BUFFERS];
 static int primemap_n = 0;
 static void primemap_add(int fd, uint32_t dumb_gem) {
     for (int i=0;i<primemap_n;i++) if (primemap[i].fd==fd){ primemap[i].dumb_gem=dumb_gem; return; }
-    if (primemap_n<MAX){ primemap[primemap_n].fd=fd; primemap[primemap_n].dumb_gem=dumb_gem; primemap_n++; }
+    if (primemap_n<HYBRIS_MAX_BUFFERS){ primemap[primemap_n].fd=fd; primemap[primemap_n].dumb_gem=dumb_gem; primemap_n++; }
     else { primemap[0].fd=fd; primemap[0].dumb_gem=dumb_gem; }
 }
 static uint32_t primemap_dumb(uint32_t fd) {
@@ -1190,9 +1180,9 @@ static int present_qpainter_dumb(uint32_t gem) {
     if (hybris_debug.sample) {
         static int n=0;
         if (n++ < 5) LOG("present_qpainter_dumb(gem=%u) src=%p kdumb_n=%d fw=%u",
-                             gem, src, kdumb_n, frame_w);
+                             gem, src, kdumb_n, hybris_frame.width);
     }
-    if (!src || !frame_w || !frame_h) return 0;
+    if (!src || !hybris_frame.width || !hybris_frame.height) return 0;
     ensure_present_fn();
     /* Preferred: hand the dumb mapping straight to drmadapter for a single
      * swizzling copy into its present buffer (one full-frame pass instead of
@@ -1200,27 +1190,27 @@ static int present_qpainter_dumb(uint32_t gem) {
      * skip the frame rather than fall through -- the scratch path below would
      * call hybris_gralloc_allocate before gralloc is loaded and assert. */
     if (g_present_cpu_fn) {
-        return g_present_cpu_fn(src, spitch ? spitch : frame_w * 4) == 0 ? 1 : 0;
+        return g_present_cpu_fn(src, spitch ? spitch : hybris_frame.width * 4) == 0 ? 1 : 0;
     }
     if (!g_qp_gralloc) {
         const int usage = 0x1000|0x800|0x200|0x33;   /* FB|COMPOSER|RENDER|SW rw */
-        if (hybris_gralloc_allocate((int)frame_w, (int)frame_h, 1 /*RGBA_8888*/, usage,
+        if (hybris_gralloc_allocate((int)hybris_frame.width, (int)hybris_frame.height, 1 /*RGBA_8888*/, usage,
                                     &g_qp_gralloc, &g_qp_stride) || !g_qp_gralloc) {
             g_qp_gralloc=NULL; return 0;
         }
     }
     void *dst=NULL;
-    if (hybris_gralloc_lock(g_qp_gralloc, 0x3|0x30, 0, 0, (int)frame_w, (int)frame_h, &dst) || !dst) return 0;
+    if (hybris_gralloc_lock(g_qp_gralloc, 0x3|0x30, 0, 0, (int)hybris_frame.width, (int)hybris_frame.height, &dst) || !dst) return 0;
     uint32_t dpitch = g_qp_stride*4;
-    if (!spitch) spitch = frame_w*4;
-    for (uint32_t y=0;y<frame_h;y++)
-        memcpy((uint8_t*)dst + (size_t)y*dpitch, (uint8_t*)src + (size_t)y*spitch, (size_t)frame_w*4);
+    if (!spitch) spitch = hybris_frame.width*4;
+    for (uint32_t y=0;y<hybris_frame.height;y++)
+        memcpy((uint8_t*)dst + (size_t)y*dpitch, (uint8_t*)src + (size_t)y*spitch, (size_t)hybris_frame.width*4);
     hybris_gralloc_unlock(g_qp_gralloc);
     present_hwc2(g_qp_gralloc);
     return 1;
 }
 static uint32_t find_gem_by_fb(uint32_t fb_id) {
-    for (int i=0;i<fmap_n;i++) if (fmap[i].fb_id==fb_id) return fmap[i].gem;
+    for (int i=0;i<hybris_buffers.n_by_gem;i++) if (hybris_buffers.by_gem[i].fb_id==fb_id) return hybris_buffers.by_gem[i].gem;
     return 0;
 }
 
@@ -1298,9 +1288,9 @@ int drmModeAddFB2WithModifiers(int fd, uint32_t w, uint32_t h, uint32_t fmt,
                                      (void*)drmModeAddFB2WithModifiers);
         return real ? real(fd,w,h,fmt,handles,pitches,offsets,mod,buf_id,flags) : -ENOSYS;
     }
-    if (!frame_w) { frame_w=w; frame_h=h; }
-    if (!dumb_map) init_dumb(fd);
-    uint32_t id=next_fake++; *buf_id=id; fmap_insert(handles[0],id);
+    if (!hybris_frame.width) { hybris_frame.width=w; hybris_frame.height=h; }
+    if (!hybris_dumb.map) init_dumb(fd);
+    uint32_t id=hybris_buffers.next_fake_fb_id++; *buf_id=id; fmap_insert(handles[0],id);
     if (hybris_debug.sample) LOG("AddFB2Mod fb=%u handle0=%u",id,handles[0]);
     return 0;
 }
@@ -1318,9 +1308,9 @@ int drmModeAddFB(int fd, uint32_t w, uint32_t h, uint8_t depth, uint8_t bpp,
         fn_t real=(fn_t)hybris_resolve_next("drmModeAddFB",(void*)drmModeAddFB);
         return real ? real(fd,w,h,depth,bpp,pitch,bo_handle,buf_id) : -ENOSYS;
     }
-    if (!frame_w) { frame_w=w; frame_h=h; }
-    if (!dumb_map) init_dumb(fd);
-    uint32_t id=next_fake++; if (buf_id) *buf_id=id; fmap_insert(bo_handle,id);
+    if (!hybris_frame.width) { hybris_frame.width=w; hybris_frame.height=h; }
+    if (!hybris_dumb.map) init_dumb(fd);
+    uint32_t id=hybris_buffers.next_fake_fb_id++; if (buf_id) *buf_id=id; fmap_insert(bo_handle,id);
     if (hybris_debug.sample)
         LOG("AddFB fb=%u handle=%u pitch=%u %ux%u bpp=%u",
                 id, bo_handle, pitch, w, h, bpp);
@@ -1337,9 +1327,9 @@ int drmModeAddFB2(int fd, uint32_t w, uint32_t h, uint32_t fmt,
         fn_t real=(fn_t)hybris_resolve_next("drmModeAddFB2",(void*)drmModeAddFB2);
         return real ? real(fd,w,h,fmt,handles,pitches,offsets,buf_id,flags) : -ENOSYS;
     }
-    if (!frame_w) { frame_w=w; frame_h=h; }
-    if (!dumb_map) init_dumb(fd);
-    uint32_t id=next_fake++; *buf_id=id; fmap_insert(handles[0],id);
+    if (!hybris_frame.width) { hybris_frame.width=w; hybris_frame.height=h; }
+    if (!hybris_dumb.map) init_dumb(fd);
+    uint32_t id=hybris_buffers.next_fake_fb_id++; *buf_id=id; fmap_insert(handles[0],id);
     if (hybris_debug.sample)
         LOG("AddFB2 fb=%u handle0=%u pitch0=%u %ux%u",
                 id, handles[0], pitches?pitches[0]:0, w, h);
@@ -1354,7 +1344,7 @@ int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle) {
     /* wlroots imports the gbm_bo's PRIME fd for scan-out, which needs DRM
      * master -- the HWC2 composer owns it, so the real import returns EACCES.
      * Use the prime fd itself as the GEM handle: gbm_hybris registered the
-     * prime_fd -> gralloc mapping (gmap) and find_gralloc()/find_by_fb() key on
+     * prime_fd -> gralloc mapping (hybris_buffers.by_prime) and find_gralloc()/find_by_fb() key on
      * the prime fd, so AddFB2/commit can still recover the buffer. */
     if (r != 0 && handle) { *handle = (uint32_t)prime_fd; r = 0; }
     if (hybris_debug.sample && handle) LOG("PrimeFDToHandle fd=%d -> handle=%u",prime_fd,*handle);
@@ -1406,7 +1396,7 @@ int drmModeSetCrtc(int fd, uint32_t crtcId, uint32_t bufferId, uint32_t x, uint3
         fn_t real=(fn_t)hybris_resolve_next("drmModeSetCrtc",(void*)drmModeSetCrtc);
         return real ? real(fd,crtcId,bufferId,x,y,connectors,count,mode) : -ENOSYS;
     }
-    if (!dumb_map) init_dumb(fd);
+    if (!hybris_dumb.map) init_dumb(fd);
 
     /* mutter blanks by calling meta_kms_device_disable(), which on the legacy
      * KMS path (MUTTER_DEBUG_FORCE_KMS_MODE=simple, as the gnome-mali session
@@ -1438,8 +1428,8 @@ int drmModePageFlip(int fd, uint32_t crtc_id, uint32_t fb_id, uint32_t flags, vo
     if (hybris_debug.sample) {
         static unsigned long fn = 0;
         if (fn++ < 12)
-            LOG("PageFlip fb=%u gem=%u gralloc=%p fmap_n=%d gmap_n=%d",
-                    fb_id, find_gem_by_fb(fb_id), (void*)h, fmap_n, gmap_n);
+            LOG("PageFlip fb=%u gem=%u gralloc=%p hybris_buffers.n_by_gem=%d hybris_buffers.n_by_prime=%d",
+                    fb_id, find_gem_by_fb(fb_id), (void*)h, hybris_buffers.n_by_gem, hybris_buffers.n_by_prime);
     }
     if (h) { copy_to_dumb(h); present_hwc2(h); }
     else present_qpainter_dumb(find_gem_by_fb(fb_id));  /* KWin QPainter dumb buffer */
@@ -1448,7 +1438,7 @@ int drmModePageFlip(int fd, uint32_t crtc_id, uint32_t fb_id, uint32_t flags, vo
      * would deliver the completion twice per flip. copy_to_dumb + real() stay
      * unconditional: phoc (wlroots) also takes this legacy path and breaks
      * without them. */
-    int r = real ? real(fd,crtc_id,dumb_fb_id?dumb_fb_id:fb_id,flags,ud) : 0;
+    int r = real ? real(fd,crtc_id,hybris_dumb.fb_id?hybris_dumb.fb_id:fb_id,flags,ud) : 0;
     return (r == -EACCES) ? 0 : r;
 }
 
@@ -1670,7 +1660,7 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReqPtr req, uint32_t flags, void *u
     /* Present ONLY commits that carry a new framebuffer (FB_ID captured from the
      * plane property). Commits WITHOUT one (cursor/gamma/empty commits -- frequent
      * during interaction) must NOT present: the old "fall back to the most recent
-     * fmap buffer" guess re-presented a STALE frame between real ones, which is
+     * hybris_buffers.by_gem buffer" guess re-presented a STALE frame between real ones, which is
      * exactly the rapid flicker on any motion (static content = no interleaved
      * empty commits = no flicker). */
     buffer_handle_t h = g_committed_fb ? find_by_fb(g_committed_fb) : NULL;
@@ -1717,8 +1707,8 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReqPtr req, uint32_t flags, void *u
         /* A buffer WAS committed but didn't resolve to a gralloc -- real problem. */
         static unsigned long z = 0;
         if ((z++ % 300) == 0)
-            LOG("PRESENT SKIPPED (unresolved fb=%u) #%lu commit=%lu fmap_n=%d gmap_n=%d",
-                    g_committed_fb, z, g_commit_n, fmap_n, gmap_n);
+            LOG("PRESENT SKIPPED (unresolved fb=%u) #%lu commit=%lu hybris_buffers.n_by_gem=%d hybris_buffers.n_by_prime=%d",
+                    g_committed_fb, z, g_commit_n, hybris_buffers.n_by_gem, hybris_buffers.n_by_prime);
     }
     g_committed_fb = 0;
     /* wlroots commits non-blocking and waits for a page-flip completion event
@@ -1755,9 +1745,9 @@ int ioctl(int fd, unsigned long request, ...) {
     TRACEALL("ioctl nr=0x%02x", nr);
     if (nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_ADDFB) && fake_kms_state()) {     /* ADDFB (legacy): fake the id, record the handle */
         struct drm_mode_fb_cmd *c=arg;
-        if (!frame_w) { frame_w=c->width; frame_h=c->height; }
-        if (!dumb_map) init_dumb(fd);
-        uint32_t id=next_fake++; c->fb_id=id; fmap_insert(c->handle,id);
+        if (!hybris_frame.width) { hybris_frame.width=c->width; hybris_frame.height=c->height; }
+        if (!hybris_dumb.map) init_dumb(fd);
+        uint32_t id=hybris_buffers.next_fake_fb_id++; c->fb_id=id; fmap_insert(c->handle,id);
         if (hybris_debug.sample)
             LOG("ioctl AddFB fb=%u handle=%u %ux%u",
                     id, c->handle, c->width, c->height);
@@ -1768,15 +1758,15 @@ int ioctl(int fd, unsigned long request, ...) {
          * handles[4], ...}, so fb[0]/fb[1] read fb_id/width as width/height,
          * and fb[6]=id wrote the fake id into handles[1] instead of fb_id. */
         struct drm_mode_fb_cmd2 *fb=arg;
-        if (!frame_w) { frame_w=fb->width; frame_h=fb->height; }
-        if (!dumb_map) init_dumb(fd);
-        uint32_t id=next_fake++;
+        if (!hybris_frame.width) { hybris_frame.width=fb->width; hybris_frame.height=fb->height; }
+        if (!hybris_dumb.map) init_dumb(fd);
+        uint32_t id=hybris_buffers.next_fake_fb_id++;
         fb->fb_id=id;
         fmap_insert(fb->handles[0], id);
         ret=0;
     } else if (nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_RMFB)) { ret=real_ioctl(fd,request,arg);
     } else if (nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_SETCRTC)) {
-        if (!dumb_map) init_dumb(fd);
+        if (!hybris_dumb.map) init_dumb(fd);
         real_ioctl(fd,request,arg); ret=0;
     } else if (nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_PAGE_FLIP)) {
         /* Legacy PAGE_FLIP (KWin's legacy DRM path).
@@ -1824,12 +1814,12 @@ int ioctl(int fd, unsigned long request, ...) {
             if (hybris_debug.sample) {
                 static unsigned long miss = 0;
                 if (miss++ < 8)
-                    LOG("flip fb=%u UNRESOLVED gem=%u fmap_n=%d gmap_n=%d",
-                            flip->fb_id, find_gem_by_fb(flip->fb_id), fmap_n, gmap_n);
+                    LOG("flip fb=%u UNRESOLVED gem=%u hybris_buffers.n_by_gem=%d hybris_buffers.n_by_prime=%d",
+                            flip->fb_id, find_gem_by_fb(flip->fb_id), hybris_buffers.n_by_gem, hybris_buffers.n_by_prime);
             }
             present_qpainter_dumb(find_gem_by_fb(flip->fb_id));  /* KWin QPainter dumb buffer */
         }
-        if (dumb_fb_id) flip->fb_id=dumb_fb_id;
+        if (hybris_dumb.fb_id) flip->fb_id=hybris_dumb.fb_id;
         ret=real_ioctl(fd,request,arg);
         /* Arm regardless of the real result: phoc's flip returns EACCES (as
          * before), KWin's returns 0 -- both need the synthetic completion or the
@@ -1839,8 +1829,8 @@ int ioctl(int fd, unsigned long request, ...) {
             synth_arm(flip->crtc_id, flip->user_data);
         ret=0;
     } else if (nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_ATOMIC)) {
-        for (int i=fmap_n-1; i>=0; i--) {
-            buffer_handle_t h=find_gralloc(fmap[i].gem);
+        for (int i=hybris_buffers.n_by_gem-1; i>=0; i--) {
+            buffer_handle_t h=find_gralloc(hybris_buffers.by_gem[i].gem);
             if (h) { copy_to_dumb(h); present_hwc2(h); break; }
         }
         ret=0;
