@@ -1847,6 +1847,11 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReqPtr req, uint32_t flags, void *u
     return 0;
 }
 
+/* Dispatch uses xf86drm.h's DRM_IOCTL_NR(): the command number only. The full
+ * DRM_IOCTL_* constants also encode the argument size, and this shim is
+ * preloaded system-wide, so a caller built against a different libdrm version
+ * would silently miss an exact match. */
+
 int ioctl(int fd, unsigned long request, ...) {
     ensure_real();
     va_list args; va_start(args,request); void *arg=va_arg(args,void*); va_end(args);
@@ -1859,7 +1864,7 @@ int ioctl(int fd, unsigned long request, ...) {
     uint32_t nr=request&0xff;
     in_hook=1; int ret;
     TRACEALL("ioctl nr=0x%02x", nr);
-    if (nr==0xae && fake_kms_state()) {     /* ADDFB (legacy): fake the id, record the handle */
+    if (nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_ADDFB) && fake_kms_state()) {     /* ADDFB (legacy): fake the id, record the handle */
         struct drm_mode_fb_cmd *c=arg;
         if (!frame_w) { frame_w=c->width; frame_h=c->height; }
         if (!dumb_map) init_dumb(fd);
@@ -1868,17 +1873,32 @@ int ioctl(int fd, unsigned long request, ...) {
             fprintf(stderr, "libdrm-hybris: ioctl AddFB fb=%u handle=%u %ux%u\n",
                     id, c->handle, c->width, c->height);
         ret=0;
-    } else if (nr==0xb8) {
-        uint32_t *fb=arg, w=fb[0], h=fb[1], gem=fb[5];
-        if (!frame_w) { frame_w=w; frame_h=h; }
+    } else if (nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_ADDFB2)) {
+        /* Was indexing arg as a raw uint32_t array with the wrong offsets:
+         * drm_mode_fb_cmd2 is {fb_id, width, height, pixel_format, flags,
+         * handles[4], ...}, so fb[0]/fb[1] read fb_id/width as width/height,
+         * and fb[6]=id wrote the fake id into handles[1] instead of fb_id. */
+        struct drm_mode_fb_cmd2 *fb=arg;
+        if (!frame_w) { frame_w=fb->width; frame_h=fb->height; }
         if (!dumb_map) init_dumb(fd);
-        uint32_t id=next_fake++; fb[6]=id; fmap_insert(gem,id); ret=0;
-    } else if (nr==0xaf) { ret=real_ioctl(fd,request,arg);
-    } else if (nr==0xa2) {
+        uint32_t id=next_fake++;
+        fb->fb_id=id;
+        fmap_insert(fb->handles[0], id);
+        ret=0;
+    } else if (nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_RMFB)) { ret=real_ioctl(fd,request,arg);
+    } else if (nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_SETCRTC)) {
         if (!dumb_map) init_dumb(fd);
         real_ioctl(fd,request,arg); ret=0;
-    } else if (nr==0xb0||nr==0xb6) {
-        /* Legacy PAGE_FLIP (KWin's legacy DRM path). Present via HWC2 and ALWAYS
+    } else if (nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_PAGE_FLIP)) {
+        /* Legacy PAGE_FLIP (KWin's legacy DRM path).
+         *
+         * GETPLANE (0xb6) used to be handled here too, which was a type
+         * confusion: its argument is a struct drm_mode_get_plane, not a
+         * drm_mode_crtc_page_flip. Reading flip->fb_id actually read the
+         * plane's crtc_id (both at byte 4), and the fb_id rewrite below
+         * clobbered that field in the caller's query. mutter enumerates planes
+         * via drmModeGetPlane(), so this fired in a normal session. GETPLANE
+         * now falls through to the real ioctl, which is what it always needed. Present via HWC2 and ALWAYS
          * synthesize the completion event: the real ioctl against the faked KMS
          * state can return 0 (not just EACCES), and without the completion the
          * compositor never schedules the next frame (renders 1-2 frames then
@@ -1929,14 +1949,14 @@ int ioctl(int fd, unsigned long request, ...) {
         if (flip->flags & DRM_MODE_PAGE_FLIP_EVENT)
             synth_arm(flip->crtc_id, flip->user_data);
         ret=0;
-    } else if (nr==0xbc) {
+    } else if (nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_ATOMIC)) {
         for (int i=fmap_n-1; i>=0; i--) {
             buffer_handle_t h=find_gralloc(fmap[i].gem);
             if (h) { copy_to_dumb(h); present_hwc2(h); break; }
         }
         ret=0;
-    } else if (nr==0x11) { ret=0;
-    } else if (nr==0xb2) {                 /* CREATE_DUMB (KWin QPainter swapchain) */
+    } else if (nr==DRM_IOCTL_NR(DRM_IOCTL_AUTH_MAGIC)) { ret=0;
+    } else if (nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_CREATE_DUMB)) {                 /* CREATE_DUMB (KWin QPainter swapchain) */
         if (fake_kms_state()) {
             /* Cached memfd-backed dumb buffer (never scanned out; see above). */
             ret=kdumb_create_memfd((struct drm_mode_create_dumb *)arg);
@@ -1944,7 +1964,7 @@ int ioctl(int fd, unsigned long request, ...) {
             ret=real_ioctl(fd,request,arg);
             if (ret==0) { struct drm_mode_create_dumb *cd=arg; kdumb_note_create(cd->handle, (size_t)cd->size, cd->pitch); }
         }
-    } else if (nr==0xb3) {                 /* MAP_DUMB */
+    } else if (nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_MAP_DUMB)) {                 /* MAP_DUMB */
         struct drm_mode_map_dumb *md=arg;
         if (fake_kms_state() && KDUMB_IS_FAKE(md->handle) && kdumb_slot_by_gem(md->handle) >= 0) {
             md->offset = KDUMB_FAKE_OFF(kdumb_slot_by_gem(md->handle));
@@ -1953,10 +1973,10 @@ int ioctl(int fd, unsigned long request, ...) {
             ret=real_ioctl(fd,request,arg);
             if (ret==0) kdumb_note_map(fd, md->handle, md->offset);
         }
-    } else if (nr==0xb4 && fake_kms_state() && KDUMB_IS_FAKE(((struct drm_mode_destroy_dumb *)arg)->handle)) {
+    } else if (nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_DESTROY_DUMB) && fake_kms_state() && KDUMB_IS_FAKE(((struct drm_mode_destroy_dumb *)arg)->handle)) {
         kdumb_destroy_memfd(((struct drm_mode_destroy_dumb *)arg)->handle);   /* DESTROY_DUMB */
         ret=0;
-    } else if (fake_kms_state() && (nr==0xa4||nr==0xa5||nr==0xab||nr==0xa3||nr==0xbb)) {
+    } else if (fake_kms_state() && (nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_GETGAMMA)||nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_SETGAMMA)||nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_SETPROPERTY)||nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_CURSOR)||nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_CURSOR2))) {
         /* Master-gated legacy state ioctls KWin's legacy path issues:
          * GETGAMMA/SETGAMMA (0xa4/0xa5), connector SETPROPERTY (0xab),
          * CURSOR/CURSOR2 (0xa3/0xbb). The Android composer owns master, so
