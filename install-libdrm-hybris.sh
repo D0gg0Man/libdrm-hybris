@@ -32,7 +32,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="${1:-$SCRIPT_DIR/src/libdrm-hybris.c}"
+SRC="${1:-$SCRIPT_DIR/src}"   # directory: all modules are built together
 OUT="/usr/lib/aarch64-linux-gnu/libdrm-hybris.so"
 LIBSEAT="/usr/lib/aarch64-linux-gnu/libseat.so.1"
 PHROG_WRAPPER="/usr/libexec/phrog-greetd-session-wrapper"

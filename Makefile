@@ -7,13 +7,23 @@ LIBDIR ?= /usr/lib/aarch64-linux-gnu
 
 OUT = built/libdrm-hybris.so
 
+# libdrm-hybris.c holds the interposed entry points; the rest is split by the
+# compositor each path exists for. common.c carries the shared state and the
+# helpers every module needs.
+SRCS = src/libdrm-hybris.c \
+       src/common.c \
+       src/wlroots.c \
+       src/kwin.c
+
+HDRS = src/common.h src/wlroots.h src/kwin.h
+
 .PHONY: all clean install
 
 all: $(OUT)
 
-$(OUT): src/libdrm-hybris.c
+$(OUT): $(SRCS) $(HDRS)
 	mkdir -p built
-	$(CC) $(CFLAGS) -o $@ $< -ldl -lEGL -lgralloc -ldrm -lwayland-server
+	$(CC) $(CFLAGS) -o $@ $(SRCS) -ldl -lEGL -lgralloc -ldrm -lwayland-server -lpthread
 
 install: all
 	install -d $(DESTDIR)$(LIBDIR)

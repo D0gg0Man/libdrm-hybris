@@ -43,6 +43,7 @@
 #include <xf86drmMode.h>
 
 #include "common.h"
+#include "kwin.h"
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <wayland-server.h>
@@ -270,7 +271,6 @@ void HWCNativeBufferSetFence(ANativeWindowBuffer *buffer, int fd) {
 
 
 
-static __thread int in_hook  = 0;
 
 typedef int (*ioctl_t)(int, unsigned long, ...);
 static ioctl_t real_ioctl = NULL;
@@ -284,10 +284,10 @@ static int trace_on = -1;
 static void tracef(const char *fmt, ...) {
     if (trace_on < 0) trace_on = hybris_debug.trace ? 1 : 0;
     if (!trace_on) return;
-    int saved = in_hook; in_hook = 1;
+    int saved = hybris_in_hook; hybris_in_hook = 1;
     FILE *f = fopen("/tmp/libdrm-hybris-trace.log", "a");
     if (f) { va_list a; va_start(a, fmt); vfprintf(f, fmt, a); va_end(a); fclose(f); }
-    in_hook = saved;
+    hybris_in_hook = saved;
 }
 
 /* ------------------------------------------------------------------------
@@ -445,7 +445,7 @@ static hwc2_present_fn hwc2_present_real(void) {
 static void stamp_phase_from_fence(int fd) {
     if (fd < 0 || !real_ioctl) return;
     struct dh_sync_file_info info; memset(&info, 0, sizeof info);
-    int saved = in_hook; in_hook = 1;
+    int saved = hybris_in_hook; hybris_in_hook = 1;
     if (real_ioctl(fd, DH_SYNC_IOC_FILE_INFO, &info) == 0 && info.num_fences) {
         struct dh_sync_fence_info *fi = calloc(info.num_fences, sizeof(*fi));
         if (fi) {
@@ -460,7 +460,7 @@ static void stamp_phase_from_fence(int fd) {
             free(fi);
         }
     }
-    in_hook = saved;
+    hybris_in_hook = saved;
 }
 
 int hwc2_compat_display_present(void *display, int32_t *out_fence) {
@@ -558,7 +558,7 @@ static void synth_arm(uint32_t crtc, uint64_t user_data) {
 static uint64_t g_last_deliver_ns = 0;  /* when the last synth completion reached the compositor */
 ssize_t read(int fd, void *buf, size_t count) {
     if (!real_read) real_read = (ssize_t(*)(int,void*,size_t))hybris_resolve_next("read",(void*)read);
-    if (!g_synth_active || fd != g_drm_fd || g_synth_qn <= 0 || in_hook)
+    if (!g_synth_active || fd != g_drm_fd || g_synth_qn <= 0 || hybris_in_hook)
         return real_read(fd, buf, count);
     if (count < sizeof(struct drm_event_vblank)) return real_read(fd, buf, count);
     struct drm_event_vblank ev; memset(&ev, 0, sizeof ev);
@@ -629,7 +629,7 @@ static int synth_poll_fixup(struct pollfd *fds, nfds_t n) {
 }
 int poll(struct pollfd *fds, nfds_t n, int timeout) {
     if (!real_poll) real_poll = (int(*)(struct pollfd*,nfds_t,int))hybris_resolve_next("poll",(void*)poll);
-    if (!g_synth_active || in_hook) return real_poll(fds, n, timeout);
+    if (!g_synth_active || hybris_in_hook) return real_poll(fds, n, timeout);
     if (synth_poll_fixup(fds, n) >= 0) return 1;
     int got = real_poll(fds, n, timeout);
     if (got == 0 && g_synth_qn > 0 && now_ns() >= g_synth_q[g_synth_qh].deadline)
@@ -639,7 +639,7 @@ int poll(struct pollfd *fds, nfds_t n, int timeout) {
 }
 int ppoll(struct pollfd *fds, nfds_t n, const struct timespec *to, const sigset_t *ss) {
     if (!real_ppoll) real_ppoll = (int(*)(struct pollfd*,nfds_t,const struct timespec*,const sigset_t*))hybris_resolve_next("ppoll",(void*)ppoll);
-    if (!g_synth_active || in_hook) return real_ppoll(fds, n, to, ss);
+    if (!g_synth_active || hybris_in_hook) return real_ppoll(fds, n, to, ss);
     if (synth_poll_fixup(fds, n) >= 0) return 1;
     int got = real_ppoll(fds, n, to, ss);
     if (got == 0 && g_synth_qn > 0 && now_ns() >= g_synth_q[g_synth_qh].deadline)
@@ -709,14 +709,14 @@ static int epoll_synth(int epfd, struct epoll_event *events, int n, int maxevent
         if (!real_read) real_read = (ssize_t(*)(int,void*,size_t))hybris_resolve_next("read",(void*)read);
         for (int i = 0; i < n; ) {
             if (events[i].data.ptr == (void *)&g_wake_fd) {
-                uint64_t v; int sv = in_hook; in_hook = 1;
+                uint64_t v; int sv = hybris_in_hook; hybris_in_hook = 1;
                 while (real_read && real_read(g_wake_fd, &v, sizeof v) == (ssize_t)sizeof v) {}
-                in_hook = sv;
+                hybris_in_hook = sv;
                 events[i] = events[n - 1]; n--;
             } else if (events[i].data.ptr == (void *)&g_timer_fd) {
-                uint64_t v; int sv = in_hook; in_hook = 1;
+                uint64_t v; int sv = hybris_in_hook; hybris_in_hook = 1;
                 while (real_read && real_read(g_timer_fd, &v, sizeof v) == (ssize_t)sizeof v) {}
-                in_hook = sv;
+                hybris_in_hook = sv;
                 events[i] = events[n - 1]; n--;
             } else i++;
         }
@@ -745,14 +745,14 @@ static int epoll_cap_timeout(int timeout) {
 
 int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout) {
     if (!real_epoll_wait) real_epoll_wait = (int(*)(int,struct epoll_event*,int,int))hybris_resolve_next("epoll_wait",(void*)epoll_wait);
-    if (!g_synth_active || in_hook || epfd != g_epoll_fd || !g_drm_epoll_valid)
+    if (!g_synth_active || hybris_in_hook || epfd != g_epoll_fd || !g_drm_epoll_valid)
         return real_epoll_wait(epfd, events, maxevents, timeout);
     int n = real_epoll_wait(epfd, events, maxevents, epoll_cap_timeout(timeout));
     return epoll_synth(epfd, events, n, maxevents);
 }
 int epoll_pwait(int epfd, struct epoll_event *events, int maxevents, int timeout, const sigset_t *ss) {
     if (!real_epoll_pwait) real_epoll_pwait = (int(*)(int,struct epoll_event*,int,int,const sigset_t*))hybris_resolve_next("epoll_pwait",(void*)epoll_pwait);
-    if (!g_synth_active || in_hook || epfd != g_epoll_fd || !g_drm_epoll_valid)
+    if (!g_synth_active || hybris_in_hook || epfd != g_epoll_fd || !g_drm_epoll_valid)
         return real_epoll_pwait(epfd, events, maxevents, timeout, ss);
     int n = real_epoll_pwait(epfd, events, maxevents, epoll_cap_timeout(timeout), ss);
     return epoll_synth(epfd, events, n, maxevents);
@@ -760,7 +760,7 @@ int epoll_pwait(int epfd, struct epoll_event *events, int maxevents, int timeout
 static int (*real_epoll_pwait2)(int,struct epoll_event*,int,const struct timespec*,const sigset_t*) = NULL;
 int epoll_pwait2(int epfd, struct epoll_event *events, int maxevents, const struct timespec *to, const sigset_t *ss) {
     if (!real_epoll_pwait2) real_epoll_pwait2 = (int(*)(int,struct epoll_event*,int,const struct timespec*,const sigset_t*))hybris_resolve_next("epoll_pwait2",(void*)epoll_pwait2);
-    if (!g_synth_active || in_hook || epfd != g_epoll_fd || !g_drm_epoll_valid)
+    if (!g_synth_active || hybris_in_hook || epfd != g_epoll_fd || !g_drm_epoll_valid)
         return real_epoll_pwait2(epfd, events, maxevents, to, ss);
     struct timespec cap; const struct timespec *eff = to;
     if (g_synth_qn > 0) {
@@ -811,17 +811,16 @@ static int g_wlroots = -1;
  * It lives in a ws module dlopen()'d RTLD_LAZY (local scope), so it can't be
  * reached by dlsym from here -- but this shim is globally preloaded, so the
  * registration goes the other way (drmadapter -> us). */
-static int (*g_present_fn)(buffer_handle_t) = NULL;
 void drm_shim_set_present(int (*fn)(buffer_handle_t)) {
-    g_present_fn = fn;
+    hybris_present_fn = fn;
     if (hybris_debug.sample) LOG("present callback registered fn=%p", (void*)fn);
 }
 /* Single-pass CPU present (QPainter/software compositors): drmadapter copies
  * the dumb-buffer mapping straight into its present buffer, skipping the
  * intermediate gralloc scratch copy this shim otherwise does. */
-static int (*g_present_cpu_fn)(const void *, uint32_t) = NULL;
+HYBRIS_INTERNAL int (*hybris_present_cpu_fn)(const void *, uint32_t) = NULL;
 void drm_shim_set_present_cpu(int (*fn)(const void *, uint32_t)) {
-    g_present_cpu_fn = fn;
+    hybris_present_cpu_fn = fn;
     if (hybris_debug.sample) LOG("cpu present callback registered fn=%p", (void*)fn);
 }
 /* drmadapter also registers a power callback so we can drive the real HWC2
@@ -841,10 +840,10 @@ void drm_shim_set_power(void (*fn)(int)) {
  * must, or the blit/HWC2 scans out a half-rendered (flickery/black) buffer.
  * Captured in drmModeAtomicAddProperty; consumed (waited + closed) here. */
 static int g_committed_fence = -1;
-static void present_hwc2(buffer_handle_t h) {
+HYBRIS_INTERNAL void hybris_present_hwc2(buffer_handle_t h) {
     if (g_wlroots < 0)
         g_wlroots = hybris_is_wlroots() || getenv("HYBRIS_WLROOTS") ? 1 : 0;
-    if (!g_wlroots || !h || !g_present_fn) {
+    if (!g_wlroots || !h || !hybris_present_fn) {
         if (g_committed_fence >= 0) { close(g_committed_fence); g_committed_fence = -1; }
         return;
     }
@@ -853,16 +852,16 @@ static void present_hwc2(buffer_handle_t h) {
      * consumes the in-fence. */
     if (g_committed_fence >= 0) {
         struct pollfd pfd = { .fd = g_committed_fence, .events = POLLIN };
-        int saved = in_hook; in_hook = 1;
+        int saved = hybris_in_hook; hybris_in_hook = 1;
         real_poll ? real_poll(&pfd, 1, 1000) : poll(&pfd, 1, 1000);
-        in_hook = saved;
+        hybris_in_hook = saved;
         static int logged = 0;
         if (!logged && hybris_debug.sample) { LOG("waited on IN_FENCE_FD %d", g_committed_fence); logged = 1; }
         close(g_committed_fence); g_committed_fence = -1;
     }
-    int rc = g_present_fn(h);
+    int rc = hybris_present_fn(h);
     static int logged2 = 0;
-    if (!logged2 && hybris_debug.sample) { LOG("first present_hwc2(h=%p) rc=%d", (void*)h, rc); logged2 = 1; }
+    if (!logged2 && hybris_debug.sample) { LOG("first hybris_present_hwc2(h=%p) rc=%d", (void*)h, rc); logged2 = 1; }
     (void)rc;
 }
 static int fmap_evict = 0;
@@ -997,9 +996,9 @@ static void copy_to_dumb(buffer_handle_t h) {
 static int init_dumb(int fd) {
     if (hybris_dumb.map) return 0;
     if (!hybris_frame.width || !hybris_frame.height) return -1;
-    int saved = in_hook; in_hook = 1;
+    int saved = hybris_in_hook; hybris_in_hook = 1;
     struct drm_mode_create_dumb cd = { .height=hybris_frame.height, .width=hybris_frame.width, .bpp=32 };
-    if (real_ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &cd)) { in_hook=saved; return -1; }
+    if (real_ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &cd)) { hybris_in_hook=saved; return -1; }
     hybris_dumb.handle=cd.handle; hybris_dumb.pitch=cd.pitch; hybris_dumb.size=cd.size;
     struct drm_mode_fb_cmd fb = {
         .width=hybris_frame.width, .height=hybris_frame.height,
@@ -1012,203 +1011,16 @@ static int init_dumb(int fd) {
             .width=hybris_frame.width, .height=hybris_frame.height, .pixel_format=0x34325258
         };
         fb2.handles[0]=hybris_dumb.handle; fb2.pitches[0]=hybris_dumb.pitch;
-        if (real_ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &fb2)) { in_hook=saved; return -1; }
+        if (real_ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &fb2)) { hybris_in_hook=saved; return -1; }
         hybris_dumb.fb_id = fb2.fb_id;
     }
     struct drm_mode_map_dumb md = { .handle=hybris_dumb.handle };
-    if (real_ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &md)) { in_hook=saved; return -1; }
+    if (real_ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &md)) { hybris_in_hook=saved; return -1; }
     hybris_dumb.map = mmap(NULL, hybris_dumb.size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, md.offset);
-    if (hybris_dumb.map == MAP_FAILED) { hybris_dumb.map=NULL; in_hook=saved; return -1; }
-    in_hook=saved; return 0;
+    if (hybris_dumb.map == MAP_FAILED) { hybris_dumb.map=NULL; hybris_in_hook=saved; return -1; }
+    hybris_in_hook=saved; return 0;
 }
 
-/* --- QPainter (software) present bridge ------------------------------------
- * KWin's QPainter DRM backend renders into DRM *dumb* buffers (CPU-mapped) and
- * page-flips them. Those aren't gralloc buffers, so present_hwc2() can't hand
- * them to HWC2. Track each dumb buffer's CPU mapping (from CREATE_DUMB /
- * MAP_DUMB), and on flip copy the composited pixels into a gralloc scratch
- * buffer that we present through the normal HWC2 path. This is the pure-software
- * compositing path that avoids the hybris GL driver (and its render corruption)
- * entirely. */
-#define KDUMB_MAX 8
-static struct { uint32_t gem; void *cpu; size_t size; uint32_t pitch; int memfd; } kdumb[KDUMB_MAX];
-static int kdumb_n = 0;
-
-/* --- Cached (memfd-backed) dumb buffers for the KWin QPainter path ---------
- * Real DRM dumb buffers mmap as write-combined memory: QPainter's blending
- * (read-modify-write) and our per-frame present readback both stall badly on
- * WC reads (~10-30ms per 1080p+ frame each). The faked KMS never scans these
- * buffers out -- they only ever live as a CPU canvas -- so back them with
- * plain CACHED anonymous memory (memfd) instead. CREATE_DUMB/MAP_DUMB are
- * answered without the kernel; the compositor's subsequent mmap() on the DRM
- * fd is redirected to the memfd by the mmap interpose below (magic offset).
- * Gated on LIBDRM_HYBRIS_FAKE_KMS_STATE (the KWin session): phoc/mutter keep
- * real dumb buffers. */
-#define KDUMB_FAKE_GEM(i)   (0x4B440000u | (uint32_t)(i))
-#define KDUMB_IS_FAKE(h)    (((h) & 0xFFFF0000u) == 0x4B440000u)
-#define KDUMB_FAKE_OFF(i)   ((0x4B44ull << 40) | ((uint64_t)(i) << 20))
-#define KDUMB_OFF_MAGIC(o)  (((uint64_t)(o) >> 40) == 0x4B44ull)
-#define KDUMB_OFF_IDX(o)    ((int)(((uint64_t)(o) >> 20) & 0xFFFFFu))
-
-static int kdumb_slot_by_gem(uint32_t gem) {
-    for (int i = 0; i < kdumb_n; i++) if (kdumb[i].gem == gem) return i;
-    return -1;
-}
-static int kdumb_create_memfd(struct drm_mode_create_dumb *cd) {
-    int slot = -1;
-    for (int i = 0; i < kdumb_n; i++) if (!kdumb[i].gem) { slot = i; break; }
-    if (slot < 0) {
-        if (kdumb_n >= KDUMB_MAX) return -ENOMEM;
-        slot = kdumb_n++;
-    }
-    /* Deferred unmap from a previous DESTROY_DUMB of this slot (see below). */
-    if (kdumb[slot].cpu) { munmap(kdumb[slot].cpu, kdumb[slot].size); kdumb[slot].cpu = NULL; }
-    uint32_t pitch = cd->width * ((cd->bpp + 7) / 8);
-    size_t size = ((size_t)pitch * cd->height + 4095) & ~(size_t)4095;
-    int mfd = (int)syscall(SYS_memfd_create, "libdrm-hybris-dumb", 0);
-    if (mfd < 0) return -errno;
-    if (ftruncate(mfd, (off_t)size) < 0) { int e = errno; close(mfd); return -e; }
-    void *cpu = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
-    if (cpu == MAP_FAILED) { int e = errno; close(mfd); return -e; }
-    kdumb[slot].gem = KDUMB_FAKE_GEM(slot);
-    kdumb[slot].cpu = cpu;
-    kdumb[slot].size = size;
-    kdumb[slot].pitch = pitch;
-    kdumb[slot].memfd = mfd;
-    cd->handle = kdumb[slot].gem;
-    cd->pitch = pitch;
-    cd->size = size;
-    if (hybris_debug.sample)
-        LOG("kdumb memfd create %ux%u gem=0x%x fd=%d (cached)",
-                cd->width, cd->height, cd->handle, mfd);
-    return 0;
-}
-static void kdumb_destroy_memfd(uint32_t gem) {
-    int i = kdumb_slot_by_gem(gem);
-    if (i < 0) return;
-    /* Keep the CPU mapping alive: the async present worker may still be
-     * copying from it (~ms). It is munmapped when the slot is reused, by
-     * which point every in-flight frame has long been presented. */
-    if (kdumb[i].memfd >= 0) close(kdumb[i].memfd);
-    kdumb[i].gem = 0; kdumb[i].memfd = -1;
-}
-/* mmap interpose: redirect the compositor's mapping of a fake dumb offset to
- * the backing memfd. Passthrough goes straight to the kernel (raw syscall) so
- * there is no dlsym/recursion hazard; everything not carrying the magic
- * offset is untouched. aarch64 mmap takes the byte offset directly. */
-void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
-    if (KDUMB_OFF_MAGIC(offset)) {
-        int idx = KDUMB_OFF_IDX(offset);
-        if (idx >= 0 && idx < kdumb_n && kdumb[idx].memfd >= 0)
-            return (void *)syscall(SYS_mmap, addr, length, prot, flags, kdumb[idx].memfd, (off_t)0);
-    }
-    return (void *)syscall(SYS_mmap, addr, length, prot, flags, fd, offset);
-}
-void *mmap64(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
-    __attribute__((alias("mmap")));
-static buffer_handle_t g_qp_gralloc = NULL;
-static uint32_t g_qp_stride = 0;
-static void kdumb_note_create(uint32_t gem, size_t size, uint32_t pitch) {
-    if (hybris_debug.sample)
-        LOG("kdumb_create gem=%u size=%zu pitch=%u", gem, size, pitch);
-    for (int i=0;i<kdumb_n;i++) if (kdumb[i].gem==gem){ kdumb[i].size=size; kdumb[i].pitch=pitch; kdumb[i].cpu=NULL; return; }
-    if (kdumb_n<KDUMB_MAX){ kdumb[kdumb_n].gem=gem; kdumb[kdumb_n].cpu=NULL; kdumb[kdumb_n].size=size; kdumb[kdumb_n].pitch=pitch; kdumb_n++; }
-}
-static void kdumb_note_map(int fd, uint32_t gem, uint64_t offset) {
-    for (int i=0;i<kdumb_n;i++) if (kdumb[i].gem==gem){
-        if (!kdumb[i].cpu && kdumb[i].size){
-            int sv=in_hook; in_hook=1;
-            void *m = mmap(NULL, kdumb[i].size, PROT_READ, MAP_SHARED, fd, (off_t)offset);
-            in_hook=sv;
-            if (m!=MAP_FAILED) kdumb[i].cpu=m;
-            if (hybris_debug.sample)
-                LOG("kdumb_map gem=%u size=%zu off=0x%llx -> %p (errno=%d)",
-                        gem, kdumb[i].size, (unsigned long long)offset, m, errno);
-        }
-        return;
-    }
-    if (hybris_debug.sample)
-        LOG("kdumb_map gem=%u NOT in kdumb (n=%d)", gem, kdumb_n);
-}
-/* KWin exports each dumb buffer with drmPrimeHandleToFD (dumb gem -> fd) and
- * then builds the scanout FB from that fd's handle, so the flipped fb's "gem"
- * is the exported fd, not the CREATE_DUMB handle. Map fd -> dumb gem so we can
- * still find the CPU mapping. */
-static struct { int fd; uint32_t dumb_gem; } primemap[HYBRIS_MAX_BUFFERS];
-static int primemap_n = 0;
-static void primemap_add(int fd, uint32_t dumb_gem) {
-    for (int i=0;i<primemap_n;i++) if (primemap[i].fd==fd){ primemap[i].dumb_gem=dumb_gem; return; }
-    if (primemap_n<HYBRIS_MAX_BUFFERS){ primemap[primemap_n].fd=fd; primemap[primemap_n].dumb_gem=dumb_gem; primemap_n++; }
-    else { primemap[0].fd=fd; primemap[0].dumb_gem=dumb_gem; }
-}
-static uint32_t primemap_dumb(uint32_t fd) {
-    for (int i=0;i<primemap_n;i++) if ((uint32_t)primemap[i].fd==fd) return primemap[i].dumb_gem;
-    return 0;
-}
-static void *kdumb_cpu(uint32_t gem, uint32_t *pitch) {
-    for (int i=0;i<kdumb_n;i++) if (kdumb[i].gem==gem){ if(pitch)*pitch=kdumb[i].pitch; return kdumb[i].cpu; }
-    uint32_t dg = primemap_dumb(gem);   /* gem may be the exported prime fd */
-    if (dg) for (int i=0;i<kdumb_n;i++) if (kdumb[i].gem==dg){ if(pitch)*pitch=kdumb[i].pitch; return kdumb[i].cpu; }
-    return NULL;
-}
-/* KWin's QPainter backend never initialises EGL, so the drmadapter platform
- * (which registers drm_shim_set_present + brings up HWC2 in its init_module) is
- * never loaded. Force it: dlopen libEGL and eglInitialize once, which loads the
- * HYBRIS_EGLPLATFORM=drmadapter module and wires up g_present_fn + HWC2. */
-static void ensure_present_fn(void) {
-    if (g_present_fn) return;
-    static int tried = 0;
-    if (tried) return;
-    tried = 1;
-    int sv = in_hook; in_hook = 1;
-    void *egl = dlopen("libEGL.so.1", RTLD_NOW | RTLD_GLOBAL);
-    if (egl) {
-        void *(*getdisp)(void *) = (void *(*)(void *))dlsym(egl, "eglGetDisplay");
-        unsigned (*init)(void *, int *, int *) = (unsigned(*)(void *,int *,int *))dlsym(egl, "eglInitialize");
-        if (getdisp && init) {
-            void *d = getdisp((void *)0);          /* EGL_DEFAULT_DISPLAY */
-            if (d) { int mj = 0, mn = 0; init(d, &mj, &mn); }
-        }
-    }
-    in_hook = sv;
-    if (hybris_debug.sample)
-        LOG("forced drmadapter EGL init, present_fn=%p", (void *)g_present_fn);
-}
-static int present_qpainter_dumb(uint32_t gem) {
-    uint32_t spitch=0;
-    void *src = kdumb_cpu(gem, &spitch);
-    if (hybris_debug.sample) {
-        static int n=0;
-        if (n++ < 5) LOG("present_qpainter_dumb(gem=%u) src=%p kdumb_n=%d fw=%u",
-                             gem, src, kdumb_n, hybris_frame.width);
-    }
-    if (!src || !hybris_frame.width || !hybris_frame.height) return 0;
-    ensure_present_fn();
-    /* Preferred: hand the dumb mapping straight to drmadapter for a single
-     * swizzling copy into its present buffer (one full-frame pass instead of
-     * two). When registered, it is authoritative: on failure (HWC2 not up yet)
-     * skip the frame rather than fall through -- the scratch path below would
-     * call hybris_gralloc_allocate before gralloc is loaded and assert. */
-    if (g_present_cpu_fn) {
-        return g_present_cpu_fn(src, spitch ? spitch : hybris_frame.width * 4) == 0 ? 1 : 0;
-    }
-    if (!g_qp_gralloc) {
-        const int usage = 0x1000|0x800|0x200|0x33;   /* FB|COMPOSER|RENDER|SW rw */
-        if (hybris_gralloc_allocate((int)hybris_frame.width, (int)hybris_frame.height, 1 /*RGBA_8888*/, usage,
-                                    &g_qp_gralloc, &g_qp_stride) || !g_qp_gralloc) {
-            g_qp_gralloc=NULL; return 0;
-        }
-    }
-    void *dst=NULL;
-    if (hybris_gralloc_lock(g_qp_gralloc, 0x3|0x30, 0, 0, (int)hybris_frame.width, (int)hybris_frame.height, &dst) || !dst) return 0;
-    uint32_t dpitch = g_qp_stride*4;
-    if (!spitch) spitch = hybris_frame.width*4;
-    for (uint32_t y=0;y<hybris_frame.height;y++)
-        memcpy((uint8_t*)dst + (size_t)y*dpitch, (uint8_t*)src + (size_t)y*spitch, (size_t)hybris_frame.width*4);
-    hybris_gralloc_unlock(g_qp_gralloc);
-    present_hwc2(g_qp_gralloc);
-    return 1;
-}
 static uint32_t find_gem_by_fb(uint32_t fb_id) {
     for (int i=0;i<hybris_buffers.n_by_gem;i++) if (hybris_buffers.by_gem[i].fb_id==fb_id) return hybris_buffers.by_gem[i].gem;
     return 0;
@@ -1233,13 +1045,13 @@ int drmModeConnectorSetProperty(int fd, uint32_t connector_id, uint32_t property
                 connector_id, property_id, (unsigned long long)value, drive, hybris_is_compositor());
     if (drive && hybris_is_compositor() && !hybris_is_gnome() && g_drm_fd < 0) g_drm_fd = fd;
     if (drive && hybris_is_compositor() && !hybris_is_gnome()) {
-        int sv = in_hook; in_hook = 1;
+        int sv = hybris_in_hook; hybris_in_hook = 1;
         drmModePropertyPtr p = drmModeGetProperty(fd, property_id);
         int is_dpms = (p && strcmp(p->name, "DPMS") == 0);
         if (hybris_debug.sample)
             LOG("prop name=[%s] is_dpms=%d", p ? p->name : "(null)", is_dpms);
         if (p) drmModeFreeProperty(p);
-        in_hook = sv;
+        hybris_in_hook = sv;
         if (is_dpms) {
             drm_shim_panel_power(value == 0 ? 1 : 0);   /* 0=On -> panel on */
             if (hybris_debug.sample)
@@ -1262,11 +1074,11 @@ int drmModeObjectSetProperty(int fd, uint32_t object_id, uint32_t object_type,
         drive = hybris_is_kwin() || getenv("LIBDRM_HYBRIS_DPMS_FROM_ACTIVE") ? 1 : 0;
     if (drive && hybris_is_compositor() && !hybris_is_gnome()) {
         if (g_drm_fd < 0) g_drm_fd = fd;
-        int sv = in_hook; in_hook = 1;
+        int sv = hybris_in_hook; hybris_in_hook = 1;
         drmModePropertyPtr p = drmModeGetProperty(fd, property_id);
         int is_dpms = (p && strcmp(p->name, "DPMS") == 0);
         if (p) drmModeFreeProperty(p);
-        in_hook = sv;
+        hybris_in_hook = sv;
         if (is_dpms) {
             drm_shim_panel_power(value == 0 ? 1 : 0);
             if (hybris_debug.sample)
@@ -1363,18 +1175,12 @@ int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd) {
     if (!hybris_is_compositor() || hybris_is_gnome())
         return real ? real(fd,handle,flags,prime_fd) : -ENOSYS;
     /* Memfd-backed fake dumb buffer: "export" the memfd itself. */
-    if (KDUMB_IS_FAKE(handle) && prime_fd) {
-        int slot = kdumb_slot_by_gem(handle);
-        if (slot >= 0 && kdumb[slot].memfd >= 0) {
-            int dfd = dup(kdumb[slot].memfd);
-            if (dfd >= 0) { *prime_fd = dfd; primemap_add(dfd, handle); return 0; }
-        }
-        return -EINVAL;
-    }
+    if (KWIN_DUMB_IS_FAKE(handle) && prime_fd)
+        return kwin_dumb_export_memfd(handle, prime_fd);
     int r = real ? real(fd,handle,flags,prime_fd) : -EACCES;
     if (r != 0 && prime_fd) {
         int dfd = dup((int)handle);       /* handle == the gbm_hybris prime fd */
-        if (dfd >= 0) { *prime_fd = dfd; r = 0; primemap_add(dfd, handle); }
+        if (dfd >= 0) { *prime_fd = dfd; r = 0; kwin_primemap_add(dfd, handle); }
         if (hybris_debug.sample) LOG("PrimeHandleToFD handle=%u -> fd=%d",handle,dfd);
     }
     return r;
@@ -1413,7 +1219,7 @@ int drmModeSetCrtc(int fd, uint32_t crtcId, uint32_t bufferId, uint32_t x, uint3
      * return h!=NULL and are handled by their flip/commit). */
     if (bufferId) {
         buffer_handle_t h = find_by_fb(bufferId);
-        if (!h) present_qpainter_dumb(find_gem_by_fb(bufferId));
+        if (!h) kwin_present_qpainter_dumb(find_gem_by_fb(bufferId));
     }
     return 0;
 }
@@ -1431,8 +1237,8 @@ int drmModePageFlip(int fd, uint32_t crtc_id, uint32_t fb_id, uint32_t flags, vo
             LOG("PageFlip fb=%u gem=%u gralloc=%p hybris_buffers.n_by_gem=%d hybris_buffers.n_by_prime=%d",
                     fb_id, find_gem_by_fb(fb_id), (void*)h, hybris_buffers.n_by_gem, hybris_buffers.n_by_prime);
     }
-    if (h) { copy_to_dumb(h); present_hwc2(h); }
-    else present_qpainter_dumb(find_gem_by_fb(fb_id));  /* KWin QPainter dumb buffer */
+    if (h) { copy_to_dumb(h); hybris_present_hwc2(h); }
+    else kwin_present_qpainter_dumb(find_gem_by_fb(fb_id));  /* KWin QPainter dumb buffer */
     /* Drive the real ioctl exactly as before -- it re-enters our raw-ioctl hook
      * (nr 0xb0), which is where the completion is synthesized. Arming here too
      * would deliver the completion twice per flip. copy_to_dumb + real() stay
@@ -1495,7 +1301,7 @@ EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config,
 static uint32_t g_crtc_id = 0;
 static uint32_t discover_crtc(int fd) {
     if (g_crtc_id) return g_crtc_id;
-    int saved = in_hook; in_hook = 1;
+    int saved = hybris_in_hook; hybris_in_hook = 1;
     drmModeRes *res = drmModeGetResources(fd);
     if (res) {
         for (int i = 0; i < res->count_connectors && !g_crtc_id; i++) {
@@ -1510,7 +1316,7 @@ static uint32_t discover_crtc(int fd) {
         if (!g_crtc_id && res->count_crtcs > 0) g_crtc_id = res->crtcs[0];
         drmModeFreeResources(res);
     }
-    in_hook = saved;
+    hybris_in_hook = saved;
     if (hybris_debug.sample)
         LOG("discovered CRTC id=%u", g_crtc_id);
     return g_crtc_id;
@@ -1617,9 +1423,9 @@ int drm_shim_panel_is_on(void) { return g_output_on; }
 int drmModeAtomicAddProperty(drmModeAtomicReqPtr req, uint32_t obj, uint32_t prop, uint64_t val) {
     typedef int (*fn_t)(drmModeAtomicReqPtr,uint32_t,uint32_t,uint64_t);
     fn_t real = (fn_t)hybris_resolve_next("drmModeAtomicAddProperty",(void*)drmModeAtomicAddProperty);
-    if (hybris_is_compositor() && g_drm_fd >= 0 && !in_hook) {
+    if (hybris_is_compositor() && g_drm_fd >= 0 && !hybris_in_hook) {
         if (!g_fbid_prop || !g_crtcid_prop || !g_infence_learned || !g_active_prop) { /* learn prop ids (device-global) */
-            in_hook = 1;
+            hybris_in_hook = 1;
             drmModePropertyPtr p = drmModeGetProperty(g_drm_fd, prop);
             if (p) {
                 if (strcmp(p->name, "FB_ID") == 0) g_fbid_prop = prop;
@@ -1628,7 +1434,7 @@ int drmModeAtomicAddProperty(drmModeAtomicReqPtr req, uint32_t obj, uint32_t pro
                 else if (strcmp(p->name, "ACTIVE") == 0) g_active_prop = prop;
                 drmModeFreeProperty(p);
             }
-            in_hook = 0;
+            hybris_in_hook = 0;
         }
         if (prop == g_fbid_prop && val) g_committed_fb = (uint32_t)val;
         /* CRTC ACTIVE=0 disables the output (DPMS off), =1 re-enables it. */
@@ -1701,7 +1507,7 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReqPtr req, uint32_t flags, void *u
             else   dc = hybris_is_gnome() ? 1 : 0;
         }
         if (dc) copy_to_dumb(h);
-        present_hwc2(h);
+        hybris_present_hwc2(h);
     }
     else if (g_committed_fb) {
         /* A buffer WAS committed but didn't resolve to a gralloc -- real problem. */
@@ -1739,9 +1545,9 @@ int ioctl(int fd, unsigned long request, ...) {
     /* Only the compositor's DRM ioctls drive the fake KMS framebuffer.
      * Client processes (camera etc) must reach the real DRM driver intact. */
     if (!hybris_is_compositor()) return real_ioctl(fd,request,arg);
-    if (in_hook) return real_ioctl(fd,request,arg);
+    if (hybris_in_hook) return real_ioctl(fd,request,arg);
     uint32_t nr=request&0xff;
-    in_hook=1; int ret;
+    hybris_in_hook=1; int ret;
     TRACEALL("ioctl nr=0x%02x", nr);
     if (nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_ADDFB) && fake_kms_state()) {     /* ADDFB (legacy): fake the id, record the handle */
         struct drm_mode_fb_cmd *c=arg;
@@ -1809,7 +1615,7 @@ int ioctl(int fd, unsigned long request, ...) {
                 last = now;
             }
         }
-        if (h) { copy_to_dumb(h); present_hwc2(h); }
+        if (h) { copy_to_dumb(h); hybris_present_hwc2(h); }
         else {
             if (hybris_debug.sample) {
                 static unsigned long miss = 0;
@@ -1817,7 +1623,7 @@ int ioctl(int fd, unsigned long request, ...) {
                     LOG("flip fb=%u UNRESOLVED gem=%u hybris_buffers.n_by_gem=%d hybris_buffers.n_by_prime=%d",
                             flip->fb_id, find_gem_by_fb(flip->fb_id), hybris_buffers.n_by_gem, hybris_buffers.n_by_prime);
             }
-            present_qpainter_dumb(find_gem_by_fb(flip->fb_id));  /* KWin QPainter dumb buffer */
+            kwin_present_qpainter_dumb(find_gem_by_fb(flip->fb_id));  /* KWin QPainter dumb buffer */
         }
         if (hybris_dumb.fb_id) flip->fb_id=hybris_dumb.fb_id;
         ret=real_ioctl(fd,request,arg);
@@ -1831,29 +1637,29 @@ int ioctl(int fd, unsigned long request, ...) {
     } else if (nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_ATOMIC)) {
         for (int i=hybris_buffers.n_by_gem-1; i>=0; i--) {
             buffer_handle_t h=find_gralloc(hybris_buffers.by_gem[i].gem);
-            if (h) { copy_to_dumb(h); present_hwc2(h); break; }
+            if (h) { copy_to_dumb(h); hybris_present_hwc2(h); break; }
         }
         ret=0;
     } else if (nr==DRM_IOCTL_NR(DRM_IOCTL_AUTH_MAGIC)) { ret=0;
     } else if (nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_CREATE_DUMB)) {                 /* CREATE_DUMB (KWin QPainter swapchain) */
         if (fake_kms_state()) {
             /* Cached memfd-backed dumb buffer (never scanned out; see above). */
-            ret=kdumb_create_memfd((struct drm_mode_create_dumb *)arg);
+            ret=kwin_dumb_create_memfd((struct drm_mode_create_dumb *)arg);
         } else {
             ret=real_ioctl(fd,request,arg);
-            if (ret==0) { struct drm_mode_create_dumb *cd=arg; kdumb_note_create(cd->handle, (size_t)cd->size, cd->pitch); }
+            if (ret==0) { struct drm_mode_create_dumb *cd=arg; kwin_dumb_note_create(cd->handle, (size_t)cd->size, cd->pitch); }
         }
     } else if (nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_MAP_DUMB)) {                 /* MAP_DUMB */
         struct drm_mode_map_dumb *md=arg;
-        if (fake_kms_state() && KDUMB_IS_FAKE(md->handle) && kdumb_slot_by_gem(md->handle) >= 0) {
-            md->offset = KDUMB_FAKE_OFF(kdumb_slot_by_gem(md->handle));
+        if (fake_kms_state() && KWIN_DUMB_IS_FAKE(md->handle) && kwin_dumb_slot_by_gem(md->handle) >= 0) {
+            md->offset = KWIN_DUMB_FAKE_OFF(kwin_dumb_slot_by_gem(md->handle));
             ret=0;
         } else {
             ret=real_ioctl(fd,request,arg);
-            if (ret==0) kdumb_note_map(fd, md->handle, md->offset);
+            if (ret==0) kwin_dumb_note_map(fd, md->handle, md->offset);
         }
-    } else if (nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_DESTROY_DUMB) && fake_kms_state() && KDUMB_IS_FAKE(((struct drm_mode_destroy_dumb *)arg)->handle)) {
-        kdumb_destroy_memfd(((struct drm_mode_destroy_dumb *)arg)->handle);   /* DESTROY_DUMB */
+    } else if (nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_DESTROY_DUMB) && fake_kms_state() && KWIN_DUMB_IS_FAKE(((struct drm_mode_destroy_dumb *)arg)->handle)) {
+        kwin_dumb_destroy_memfd(((struct drm_mode_destroy_dumb *)arg)->handle);   /* DESTROY_DUMB */
         ret=0;
     } else if (fake_kms_state() && (nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_GETGAMMA)||nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_SETGAMMA)||nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_SETPROPERTY)||nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_CURSOR)||nr==DRM_IOCTL_NR(DRM_IOCTL_MODE_CURSOR2))) {
         /* Master-gated legacy state ioctls KWin's legacy path issues:
@@ -1872,5 +1678,5 @@ int ioctl(int fd, unsigned long request, ...) {
         ret=real_ioctl(fd,request,arg);
         if (ret!=0) ret=0;
     } else { ret=real_ioctl(fd,request,arg); }
-    in_hook=0; return ret;
+    hybris_in_hook=0; return ret;
 }

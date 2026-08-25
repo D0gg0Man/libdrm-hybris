@@ -17,6 +17,9 @@ HYBRIS_INTERNAL struct hybris_debug_flags   hybris_debug;
 HYBRIS_INTERNAL struct hybris_buffer_registry hybris_buffers = { .next_fake_fb_id = 0x80000000u };
 HYBRIS_INTERNAL struct hybris_dumb_buffer     hybris_dumb;
 HYBRIS_INTERNAL struct hybris_frame_geometry  hybris_frame;
+HYBRIS_INTERNAL __thread int hybris_in_hook;
+HYBRIS_INTERNAL int (*hybris_present_fn) (buffer_handle_t handle);
+
 HYBRIS_INTERNAL struct hybris_tuning hybris_tuning = {
     .touch_sync = true,
     .row_step   = 64,
