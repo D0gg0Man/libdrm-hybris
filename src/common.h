@@ -40,8 +40,14 @@
 
 HYBRIS_INTERNAL void hybris_logv (const char *fmt, va_list ap);
 HYBRIS_INTERNAL void hybris_log (const char *fmt, ...) __attribute__((format (printf, 1, 2)));
+HYBRIS_INTERNAL void hybris_warn (const char *fmt, ...) __attribute__((format (printf, 1, 2)));
 
-#define LOG(fmt, ...)   hybris_log ("libdrm-hybris: " fmt, ##__VA_ARGS__)
+/* LOG()      -- diagnostics, silent unless a debug variable is set.
+ * LOG_WARN()  -- something went wrong; always printed. Keep these rare: this
+ *                library is preloaded into every process, so anything it
+ *                prints unconditionally appears in unrelated programs' output. */
+#define LOG(fmt, ...)       hybris_log ("libdrm-hybris: " fmt, ##__VA_ARGS__)
+#define LOG_WARN(fmt, ...)  hybris_warn ("libdrm-hybris: " fmt, ##__VA_ARGS__)
 
 /* Verbose paths, each behind its own flag so a debugging session can enable
  * one without drowning in the others. */

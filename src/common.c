@@ -47,6 +47,17 @@ hybris_log (const char *fmt, ...)
     va_end (ap);
 }
 
+HYBRIS_INTERNAL void
+hybris_warn (const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start (ap, fmt);
+    vfprintf (stderr, fmt, ap);
+    fputc ('\n', stderr);
+    va_end (ap);
+}
+
 /* ---- init --------------------------------------------------------------- */
 
 HYBRIS_INTERNAL void
