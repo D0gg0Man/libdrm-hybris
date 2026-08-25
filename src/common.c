@@ -18,7 +18,7 @@ HYBRIS_INTERNAL struct hybris_buffer_registry hybris_buffers = { .next_fake_fb_i
 HYBRIS_INTERNAL struct hybris_dumb_buffer     hybris_dumb;
 HYBRIS_INTERNAL struct hybris_frame_geometry  hybris_frame;
 HYBRIS_INTERNAL __thread int hybris_in_hook;
-HYBRIS_INTERNAL int(*hybris_present_fn) (buffer_handle_t handle);
+HYBRIS_INTERNAL int (*hybris_present_fn)(buffer_handle_t handle);
 
 HYBRIS_INTERNAL struct hybris_tuning hybris_tuning = {
     .touch_sync = true,
@@ -139,7 +139,7 @@ HYBRIS_INTERNAL bool hybris_is_compositor(void) {
         }
     }
 
-    /* KWin ships under several names(kwin_wayland, kwin_wayland_wrapper). */
+    /* KWin ships under several names (kwin_wayland, kwin_wayland_wrapper). */
     if (!cached && strstr(base, "kwin"))
         cached = 1;
 

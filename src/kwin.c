@@ -190,7 +190,7 @@ static void kwin_ensure_present_fn(void) {
     void *egl = dlopen("libEGL.so.1", RTLD_NOW | RTLD_GLOBAL);
     if (egl) {
         void *(*getdisp)(void *) = (void *(*)(void *))dlsym(egl, "eglGetDisplay");
-        unsigned (*init)(void *, int *, int *) = (unsigned(*)(void *,int *,int *))dlsym(egl, "eglInitialize");
+        unsigned (*init)(void *, int *, int *) = (unsigned (*)(void *,int *,int *))dlsym(egl, "eglInitialize");
         if (getdisp && init) {
             void *d = getdisp((void *)0);          /* EGL_DEFAULT_DISPLAY */
             if (d) { int mj = 0, mn = 0; init(d, &mj, &mn); }

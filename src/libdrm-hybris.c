@@ -568,7 +568,7 @@ static int synth_poll_fixup(struct pollfd *fds, nfds_t n) {
     return -1;
 }
 int poll(struct pollfd *fds, nfds_t n, int timeout) {
-    if (!real_poll) real_poll = (int(*)(struct pollfd*,nfds_t,int))hybris_resolve_next("poll",(void*)poll);
+    if (!real_poll) real_poll = (int (*)(struct pollfd*,nfds_t,int))hybris_resolve_next("poll",(void*)poll);
     if (!g_synth_active || hybris_in_hook) return real_poll(fds, n, timeout);
     if (synth_poll_fixup(fds, n) >= 0) return 1;
     int got = real_poll(fds, n, timeout);
@@ -578,7 +578,7 @@ int poll(struct pollfd *fds, nfds_t n, int timeout) {
     return got;
 }
 int ppoll(struct pollfd *fds, nfds_t n, const struct timespec *to, const sigset_t *ss) {
-    if (!real_ppoll) real_ppoll = (int(*)(struct pollfd*,nfds_t,const struct timespec*,const sigset_t*))hybris_resolve_next("ppoll",(void*)ppoll);
+    if (!real_ppoll) real_ppoll = (int (*)(struct pollfd*,nfds_t,const struct timespec*,const sigset_t*))hybris_resolve_next("ppoll",(void*)ppoll);
     if (!g_synth_active || hybris_in_hook) return real_ppoll(fds, n, to, ss);
     if (synth_poll_fixup(fds, n) >= 0) return 1;
     int got = real_ppoll(fds, n, to, ss);
@@ -605,7 +605,7 @@ static int fd_is_drm(int fd) {
 }
 
 int epoll_ctl(int epfd, int op, int fd, struct epoll_event *ev) {
-    if (!real_epoll_ctl) real_epoll_ctl = (int(*)(int,int,int,struct epoll_event*))hybris_resolve_next("epoll_ctl",(void*)epoll_ctl);
+    if (!real_epoll_ctl) real_epoll_ctl = (int (*)(int,int,int,struct epoll_event*))hybris_resolve_next("epoll_ctl",(void*)epoll_ctl);
     int r = real_epoll_ctl(epfd, op, fd, ev);
     if (hybris_is_compositor() && ev && (op == EPOLL_CTL_ADD || op == EPOLL_CTL_MOD) && fd_is_drm(fd)) {
         g_epoll_fd = epfd; g_drm_epoll_data = ev->data; g_drm_epoll_valid = 1;
@@ -684,14 +684,14 @@ static int epoll_cap_timeout(int timeout) {
 }
 
 int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout) {
-    if (!real_epoll_wait) real_epoll_wait = (int(*)(int,struct epoll_event*,int,int))hybris_resolve_next("epoll_wait",(void*)epoll_wait);
+    if (!real_epoll_wait) real_epoll_wait = (int (*)(int,struct epoll_event*,int,int))hybris_resolve_next("epoll_wait",(void*)epoll_wait);
     if (!g_synth_active || hybris_in_hook || epfd != g_epoll_fd || !g_drm_epoll_valid)
         return real_epoll_wait(epfd, events, maxevents, timeout);
     int n = real_epoll_wait(epfd, events, maxevents, epoll_cap_timeout(timeout));
     return epoll_synth(epfd, events, n, maxevents);
 }
 int epoll_pwait(int epfd, struct epoll_event *events, int maxevents, int timeout, const sigset_t *ss) {
-    if (!real_epoll_pwait) real_epoll_pwait = (int(*)(int,struct epoll_event*,int,int,const sigset_t*))hybris_resolve_next("epoll_pwait",(void*)epoll_pwait);
+    if (!real_epoll_pwait) real_epoll_pwait = (int (*)(int,struct epoll_event*,int,int,const sigset_t*))hybris_resolve_next("epoll_pwait",(void*)epoll_pwait);
     if (!g_synth_active || hybris_in_hook || epfd != g_epoll_fd || !g_drm_epoll_valid)
         return real_epoll_pwait(epfd, events, maxevents, timeout, ss);
     int n = real_epoll_pwait(epfd, events, maxevents, epoll_cap_timeout(timeout), ss);
@@ -699,7 +699,7 @@ int epoll_pwait(int epfd, struct epoll_event *events, int maxevents, int timeout
 }
 static int (*real_epoll_pwait2)(int,struct epoll_event*,int,const struct timespec*,const sigset_t*) = NULL;
 int epoll_pwait2(int epfd, struct epoll_event *events, int maxevents, const struct timespec *to, const sigset_t *ss) {
-    if (!real_epoll_pwait2) real_epoll_pwait2 = (int(*)(int,struct epoll_event*,int,const struct timespec*,const sigset_t*))hybris_resolve_next("epoll_pwait2",(void*)epoll_pwait2);
+    if (!real_epoll_pwait2) real_epoll_pwait2 = (int (*)(int,struct epoll_event*,int,const struct timespec*,const sigset_t*))hybris_resolve_next("epoll_pwait2",(void*)epoll_pwait2);
     if (!g_synth_active || hybris_in_hook || epfd != g_epoll_fd || !g_drm_epoll_valid)
         return real_epoll_pwait2(epfd, events, maxevents, to, ss);
     struct timespec cap; const struct timespec *eff = to;

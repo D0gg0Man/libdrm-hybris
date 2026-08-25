@@ -48,7 +48,7 @@ static int is_gnome_shell(void) {
 typedef void *(*server_wlegl_create_t)(struct wl_display *);
 
 struct wl_display *wl_display_create(void) {
-    typedef struct wl_display *(*fn_t)(void);
+    typedef struct wl_display * (*fn_t)(void);
     fn_t real = hybris_resolve_next("wl_display_create", (void *)wl_display_create);
     if (!real) return NULL;
     struct wl_display *dpy = real();

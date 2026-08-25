@@ -29,7 +29,7 @@
 
 /* This shim is in /etc/ld.so.preload, so every symbol it exports lands in the
  * global namespace of every process on the system. Only the interposed entry
- * points(ioctl, open, drmMode*, ...) and the drm_shim_* API that drmadapter
+ * points (ioctl, open, drmMode*, ...) and the drm_shim_* API that drmadapter
  * dlsym()s may be visible; everything internal is hidden. */
 #define HYBRIS_INTERNAL __attribute__((visibility("hidden")))
 
@@ -55,7 +55,7 @@ HYBRIS_INTERNAL void hybris_warn(const char *fmt, ...) __attribute__((format(pri
     do { if (hybris_debug.flag) LOG(fmt, ##__VA_ARGS__); } while (0)
 
 /* Environment-controlled behaviour, read once at load instead of calling
- * getenv() on hot paths(the previous code did that 54 times). */
+ * getenv() on hot paths (the previous code did that 54 times). */
 struct hybris_debug_flags {
     bool trace;         /* LIBDRM_HYBRIS_TRACE  -- ioctl tracing to a file  */
     bool sample;        /* LIBDRM_HYBRIS_SAMPLE -- framebuffer bookkeeping  */
@@ -152,7 +152,7 @@ HYBRIS_INTERNAL extern struct hybris_frame_geometry  hybris_frame;
 HYBRIS_INTERNAL void hybris_present_hwc2(buffer_handle_t handle);
 
 /* Registered by the drmadapter EGL platform through drm_shim_set_present(). */
-extern HYBRIS_INTERNAL int(*hybris_present_fn) (buffer_handle_t handle);
+extern HYBRIS_INTERNAL int (*hybris_present_fn)(buffer_handle_t handle);
 
 /* Recursion guard: the interposers call back into libc, which would re-enter
  * them. Thread-local because compositors present from more than one thread. */
@@ -160,10 +160,10 @@ extern HYBRIS_INTERNAL __thread int hybris_in_hook;
 
 /* Registered by drmadapter when it can take a CPU-side buffer directly, which
  * saves one full-frame copy on the software-composited path. */
-extern HYBRIS_INTERNAL int(*hybris_present_cpu_fn) (const void *src, uint32_t pitch);
+extern HYBRIS_INTERNAL int (*hybris_present_cpu_fn)(const void *src, uint32_t pitch);
 
 /* ---- symbol resolution --------------------------------------------------
- * dlsym(RTLD_NEXT) is not enough on its own: this shim is installed both as
+ * dlsym (RTLD_NEXT) is not enough on its own: this shim is installed both as
  * libdrm-hybris.so and as libseat.so.1, so RTLD_NEXT can resolve back into
  * another copy of itself and recurse forever. resolve_next() detects that. */
 
