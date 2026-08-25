@@ -49,10 +49,3 @@ phosh renders as a Wayland client via the drmadapter platform.
 make
 sudo make install
 ```
-
-*Known limitations*
-
-Screen tearing at high refresh rates is a structural limitation of the
-wlroots hwcomposer backend's synchronous sync_wait() fence architecture.
-The stock FuriOS phosh session has the same behaviour. The proper fix is
-a wlroots patch moving the fence wait off the main thread.
