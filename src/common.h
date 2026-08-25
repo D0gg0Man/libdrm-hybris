@@ -29,33 +29,33 @@
 
 /* This shim is in /etc/ld.so.preload, so every symbol it exports lands in the
  * global namespace of every process on the system. Only the interposed entry
- * points (ioctl, open, drmMode*, ...) and the drm_shim_* API that drmadapter
+ * points(ioctl, open, drmMode*, ...) and the drm_shim_* API that drmadapter
  * dlsym()s may be visible; everything internal is hidden. */
-#define HYBRIS_INTERNAL __attribute__((visibility ("hidden")))
+#define HYBRIS_INTERNAL __attribute__((visibility("hidden")))
 
 /* ---- logging ------------------------------------------------------------
  * Same call-site shape as gbm_hybris/drmadapter's LOG(), minus glib. Output is
  * off unless the matching environment variable is set, so a preloaded shim
  * stays silent in normal operation. */
 
-HYBRIS_INTERNAL void hybris_logv (const char *fmt, va_list ap);
-HYBRIS_INTERNAL void hybris_log (const char *fmt, ...) __attribute__((format (printf, 1, 2)));
-HYBRIS_INTERNAL void hybris_warn (const char *fmt, ...) __attribute__((format (printf, 1, 2)));
+HYBRIS_INTERNAL void hybris_logv(const char *fmt, va_list ap);
+HYBRIS_INTERNAL void hybris_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+HYBRIS_INTERNAL void hybris_warn(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 /* LOG()      -- diagnostics, silent unless a debug variable is set.
  * LOG_WARN()  -- something went wrong; always printed. Keep these rare: this
  *                library is preloaded into every process, so anything it
  *                prints unconditionally appears in unrelated programs' output. */
-#define LOG(fmt, ...)       hybris_log ("libdrm-hybris: " fmt, ##__VA_ARGS__)
-#define LOG_WARN(fmt, ...)  hybris_warn ("libdrm-hybris: " fmt, ##__VA_ARGS__)
+#define LOG(fmt, ...)       hybris_log("libdrm-hybris: " fmt, ##__VA_ARGS__)
+#define LOG_WARN(fmt, ...)  hybris_warn("libdrm-hybris: " fmt, ##__VA_ARGS__)
 
 /* Verbose paths, each behind its own flag so a debugging session can enable
  * one without drowning in the others. */
 #define LOG_IF(flag, fmt, ...) \
-    do { if (hybris_debug.flag) LOG (fmt, ##__VA_ARGS__); } while (0)
+    do { if (hybris_debug.flag) LOG(fmt, ##__VA_ARGS__); } while (0)
 
 /* Environment-controlled behaviour, read once at load instead of calling
- * getenv() on hot paths (the previous code did that 54 times). */
+ * getenv() on hot paths(the previous code did that 54 times). */
 struct hybris_debug_flags {
     bool trace;         /* LIBDRM_HYBRIS_TRACE  -- ioctl tracing to a file  */
     bool sample;        /* LIBDRM_HYBRIS_SAMPLE -- framebuffer bookkeeping  */
@@ -65,21 +65,21 @@ struct hybris_debug_flags {
 
 HYBRIS_INTERNAL extern struct hybris_debug_flags hybris_debug;
 
-HYBRIS_INTERNAL void hybris_common_init (void);
+HYBRIS_INTERNAL void hybris_common_init(void);
 
 /* ---- process role -------------------------------------------------------
  * Only a compositor may drive the faked KMS state; every other process must
  * reach the real driver untouched. */
 
-HYBRIS_INTERNAL bool hybris_is_compositor (void);
-HYBRIS_INTERNAL bool hybris_is_gnome (void);
+HYBRIS_INTERNAL bool hybris_is_compositor(void);
+HYBRIS_INTERNAL bool hybris_is_gnome(void);
 
 /* Compositors whose DRM behaviour differs enough to need their own paths.
  * Detected from the executable name; the old code required the session to
  * export LIBDRM_HYBRIS_FAKE_KMS_STATE / HYBRIS_WLROOTS instead, which meant a
  * session file that forgot them silently got the wrong behaviour. */
-HYBRIS_INTERNAL bool hybris_is_kwin (void);
-HYBRIS_INTERNAL bool hybris_is_wlroots (void);
+HYBRIS_INTERNAL bool hybris_is_kwin(void);
+HYBRIS_INTERNAL bool hybris_is_wlroots(void);
 
 /* ---- tuning -------------------------------------------------------------
  * Defaults are the measured-correct values for this stack. Environment
@@ -149,10 +149,10 @@ HYBRIS_INTERNAL extern struct hybris_frame_geometry  hybris_frame;
  * and the fence handling; it is declared here because wlroots.c, kwin.c and
  * mutter.c all present through it. */
 
-HYBRIS_INTERNAL void hybris_present_hwc2 (buffer_handle_t handle);
+HYBRIS_INTERNAL void hybris_present_hwc2(buffer_handle_t handle);
 
 /* Registered by the drmadapter EGL platform through drm_shim_set_present(). */
-extern HYBRIS_INTERNAL int (*hybris_present_fn) (buffer_handle_t handle);
+extern HYBRIS_INTERNAL int(*hybris_present_fn) (buffer_handle_t handle);
 
 /* Recursion guard: the interposers call back into libc, which would re-enter
  * them. Thread-local because compositors present from more than one thread. */
@@ -160,13 +160,13 @@ extern HYBRIS_INTERNAL __thread int hybris_in_hook;
 
 /* Registered by drmadapter when it can take a CPU-side buffer directly, which
  * saves one full-frame copy on the software-composited path. */
-extern HYBRIS_INTERNAL int (*hybris_present_cpu_fn) (const void *src, uint32_t pitch);
+extern HYBRIS_INTERNAL int(*hybris_present_cpu_fn) (const void *src, uint32_t pitch);
 
 /* ---- symbol resolution --------------------------------------------------
  * dlsym(RTLD_NEXT) is not enough on its own: this shim is installed both as
  * libdrm-hybris.so and as libseat.so.1, so RTLD_NEXT can resolve back into
  * another copy of itself and recurse forever. resolve_next() detects that. */
 
-HYBRIS_INTERNAL void *hybris_resolve_next (const char *name, void *self_addr);
+HYBRIS_INTERNAL void *hybris_resolve_next(const char *name, void *self_addr);
 
 #endif /* LIBDRM_HYBRIS_COMMON_H */

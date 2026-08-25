@@ -11,8 +11,8 @@
 
 #include "common.h"
 
-/* Implemented in libdrm-hybris.c: shared with phoc (which calls it directly by
+/* Implemented in libdrm-hybris.c: shared with phoc(which calls it directly by
  * dlsym) and with KWin's DPMS path. */
-void drm_shim_panel_power (int on);
+void drm_shim_panel_power(int on);
 
 #endif /* LIBDRM_HYBRIS_MUTTER_H */
