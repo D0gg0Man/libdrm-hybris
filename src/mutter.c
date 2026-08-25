@@ -32,7 +32,7 @@
 
 #include <wayland-server.h>
 
-/* BUG 4 fix: only inject wlegl into gnome-shell itself, not every
+/* only inject wlegl into gnome-shell itself, not every
  * wayland server that happens to run in a gnome session */
 static int is_gnome_shell(void) {
     char buf[256] = {0};
@@ -65,13 +65,7 @@ struct wl_display *wl_display_create(void) {
 }
 
 
-/* mutter's blank never reaches the panel on this backend: it calls
- * meta_kms_device_disable(), whose DRM traffic is swallowed here, and with
- * MUTTER_DEBUG_FORCE_KMS_MODE=simple it emits neither an atomic ACTIVE commit
- * nor a DPMS property set nor a legacy CRTC disable -- all three existing
- * detection paths were checked on device and none fire. Rather than keep
- * guessing which ioctl carries it, take the signal from the one place that is
- * unambiguous: gnome-shell's powerManager, which writes this file in
+/*  
  * _turnOffScreen()/_turnOnScreen(). Values are HWC2-ish: 0 = off, 1 = on. */
 static void *panel_ctl_thread(void *unused) {
     (void)unused;
@@ -98,13 +92,6 @@ static void *panel_ctl_thread(void *unused) {
 
 __attribute__((constructor))
 static void panel_ctl_start(void) {
-    /* No env gate: the is_compositor() check below is the real condition, and
-     * requiring a variable only meant the session could forget it. */
-    /* Only the compositor holds an HWC2 display handle. Without this gate every
-     * hybris client that inherits the session env (thumbnailers especially --
-     * 1125 of them in one boot) spawns a polling thread that can only ever call
-     * setPowerMode with a NULL handle. A battery fix should not ship idle
-     * pollers in every process on the system. */
     if (!hybris_is_compositor()) return;
     pthread_t t;
     if (pthread_create(&t, NULL, panel_ctl_thread, NULL) == 0)
