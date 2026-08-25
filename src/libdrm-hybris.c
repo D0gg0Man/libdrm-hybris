@@ -330,7 +330,15 @@ struct wl_display *wl_display_create(void) {
 }
 
 
-extern void *g_hwc_display;
+/* HWC2 power modes (hardware/graphics/composer/2.1 IComposerClient::PowerMode).
+ * Only OFF and ON are used here: DOZE/DOZE_SUSPEND need AOD enabled or the
+ * vendor HAL logs "without aod enabled" and ignores them. */
+#define HWC2_POWER_MODE_OFF 0
+#define HWC2_POWER_MODE_ON  2
+
+/* Captured in hwc2_compat_display_present(); file-static so the shim does not
+ * export an extra symbol into every process it is preloaded into. */
+static void *g_hwc_display = NULL;
 
 /* ==========================================================================
  * 5. HWC2 VSYNC -- always succeed so schedule_frame() keeps running
@@ -591,6 +599,15 @@ static void stamp_phase_from_fence(int fd) {
 
 int hwc2_compat_display_present(void *display, int32_t *out_fence) {
     g_hwc_display = display;   /* needed by drm_shim_panel_power() below */
+    /* mutter keeps committing frames after the shell blanks. Presenting into a
+     * panel that is powered OFF risks blocking on an acquire fence the HAL will
+     * never signal, and the compositor then comes back with the backlight lit
+     * but nothing painted. Drop frames while the panel is down instead. */
+    extern int drm_shim_panel_is_on(void);
+    if (!drm_shim_panel_is_on()) {
+        if (out_fence) *out_fence = -1;
+        return 0;
+    }
     hwc2_present_fn real = hwc2_present_real();
     if (!real) { if (out_fence) *out_fence = -1; return 0; }  /* fail OPEN */
     int r = real(display, out_fence);
@@ -940,7 +957,6 @@ void drm_shim_set_present_cpu(int (*fn)(const void *, uint32_t)) {
  * output-disable commit powers the panel down and the re-enable commit (driven
  * by phosh on wake input) powers it back up. */
 static void (*g_power_fn)(int) = NULL;
-void *g_hwc_display = NULL;   /* captured in hwc2_compat_display_present() */
 void drm_shim_set_power(void (*fn)(int)) {
     g_power_fn = fn;
     if (getenv("LIBDRM_HYBRIS_SAMPLE")) fprintf(stderr, "libdrm-hybris: power callback registered fn=%p\n", (void*)fn);
@@ -1667,7 +1683,7 @@ static void *panel_ctl_thread(void *unused) {
                 fclose(f);
             }
         }
-        usleep(200000);
+        usleep(50000);
     }
     return NULL;
 }
@@ -1710,7 +1726,7 @@ void drm_shim_panel_power(int on) {
                         (void *)set_pm, g_hwc_display);
         }
         if (set_pm && g_hwc_display)
-            set_pm(g_hwc_display, on ? 2 : 0);
+            set_pm(g_hwc_display, on ? HWC2_POWER_MODE_ON : HWC2_POWER_MODE_OFF);
     }
     if (getenv("LIBDRM_HYBRIS_PANEL_CTL_DEBUG"))
         fprintf(stderr, "libdrm-hybris: drm_shim_panel_power -> %s\n", on ? "ON" : "OFF");
