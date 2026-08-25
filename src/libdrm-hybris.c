@@ -41,6 +41,8 @@
 #include <hybris/gralloc/gralloc.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+
+#include "common.h"
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <wayland-server.h>
@@ -55,38 +57,7 @@
  * the whole point is that phoc (the compositor) calls libseat, and phoc IS
  * a compositor. Non-compositors that call libseat (rare) still get our fake,
  * which is harmless -- they would have used seatd otherwise. */
-static int is_compositor(void) {
-    static int cached = -1;
-    if (cached != -1) return cached;
-    char buf[256] = {0};
-    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (n < 0) { cached = 0; return 0; }
-    buf[n] = '\0';
-    /* Match on the basename of known compositors that drive HWC2 directly */
-    const char *base = strrchr(buf, '/');
-    base = base ? base + 1 : buf;
-    cached =
-        strcmp(base, "phoc") == 0        ||
-        strcmp(base, "gnome-shell") == 0 ||
-        strcmp(base, "mutter") == 0      ||
-        strcmp(base, "weston") == 0      ||
-        strcmp(base, "wlroots") == 0     ||
-        strstr(base, "kwin") != NULL     ||
-        strcmp(base, "sway") == 0;
-    return cached;
-}
-
 /* Runtime session detection */
-static int is_gnome(void) {
-    const char *d = getenv("XDG_SESSION_DESKTOP");
-    if (d && strcmp(d, "gnome") == 0) return 1;
-    /* gnome-mali unsets XDG_SESSION_DESKTOP before import-environment,
-     * so fall back to XDG_CURRENT_DESKTOP. Exact match "GNOME" only --
-     * phosh uses "Phosh:GNOME" which must NOT match. */
-    d = getenv("XDG_CURRENT_DESKTOP");
-    return d && strcmp(d, "GNOME") == 0;
-}
-
 /* BUG 4 fix: only inject wlegl into gnome-shell itself, not every
  * wayland server that happens to run in a gnome session */
 static int is_gnome_shell(void) {
@@ -103,25 +74,6 @@ static int is_gnome_shell(void) {
  * function (at a different address), causing infinite recursion.
  * Detect duplicates by comparing the build of the resolved symbol's
  * library against our own using a marker symbol unique to this shim. */
-static void *resolve_next(const char *name, void *self_addr) {
-    void *fn = dlsym(RTLD_NEXT, name);
-    if (!fn || fn == self_addr) return NULL;
-    /* If the resolved copy lives in a library that also exports our
-     * unique marker, it is another copy of this shim -- skip it. */
-    Dl_info info;
-    if (dladdr(fn, &info) && info.dli_fname) {
-        void *h = dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD);
-        if (h) {
-            int is_dup = dlsym(h, "libdrm_hybris_shim_marker") != NULL;
-            dlclose(h);
-            if (is_dup) return NULL;
-        }
-    }
-    return fn;
-}
-
-/* Unique marker exported so resolve_next can identify copies of this shim */
-int libdrm_hybris_shim_marker = 1;
 
 
 /* ==========================================================================
@@ -206,18 +158,18 @@ void        libseat_set_log_level(int level)                 { (void)level; }
  * ========================================================================== */
 
 char *drmGetRenderDeviceNameFromFd(int fd) {
-    if (!is_compositor()) {
+    if (!hybris_is_compositor()) {
         typedef char *(*fn_t)(int);
-        fn_t real=(fn_t)resolve_next("drmGetRenderDeviceNameFromFd",
+        fn_t real=(fn_t)hybris_resolve_next("drmGetRenderDeviceNameFromFd",
                                      (void*)drmGetRenderDeviceNameFromFd);
         return real ? real(fd) : NULL;
     }
     return strdup("/dev/dri/card0");
 }
 int drmGetNodeTypeFromFd(int fd) {
-    if (!is_compositor()) {
+    if (!hybris_is_compositor()) {
         typedef int (*fn_t)(int);
-        fn_t real=(fn_t)resolve_next("drmGetNodeTypeFromFd",(void*)drmGetNodeTypeFromFd);
+        fn_t real=(fn_t)hybris_resolve_next("drmGetNodeTypeFromFd",(void*)drmGetNodeTypeFromFd);
         return real ? real(fd) : -1;
     }
     return DRM_NODE_PRIMARY;
@@ -225,10 +177,10 @@ int drmGetNodeTypeFromFd(int fd) {
 
 int drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device) {
     static int (*real_fn)(int, uint32_t, drmDevicePtr *) = NULL;
-    if (!real_fn) real_fn = resolve_next("drmGetDevice2", (void *)drmGetDevice2);
+    if (!real_fn) real_fn = hybris_resolve_next("drmGetDevice2", (void *)drmGetDevice2);
     if (!real_fn) return -ENOSYS;
     int r = real_fn(fd, flags, device);
-    if (r == 0 && *device && is_compositor()) {
+    if (r == 0 && *device && hybris_is_compositor()) {
         (*device)->available_nodes |= (1 << DRM_NODE_RENDER);
         (*device)->nodes[DRM_NODE_RENDER] = strdup((*device)->nodes[DRM_NODE_PRIMARY]);
     }
@@ -236,8 +188,8 @@ int drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device) {
 }
 int drmGetCap(int fd, uint64_t cap, uint64_t *value) {
     static int (*real_fn)(int, uint64_t, uint64_t *) = NULL;
-    if (!real_fn) real_fn = resolve_next("drmGetCap", (void *)drmGetCap);
-    if (is_compositor()) {
+    if (!real_fn) real_fn = hybris_resolve_next("drmGetCap", (void *)drmGetCap);
+    if (hybris_is_compositor()) {
         switch (cap) {
             case DRM_CAP_PRIME:                 *value = DRM_PRIME_CAP_IMPORT|DRM_PRIME_CAP_EXPORT; return 0;
             case DRM_CAP_CRTC_IN_VBLANK_EVENT: *value = 1; return 0;
@@ -249,7 +201,7 @@ int drmGetCap(int fd, uint64_t cap, uint64_t *value) {
 }
 int drmSetClientCap(int fd, uint64_t cap, uint64_t value) {
     static int (*real_fn)(int, uint64_t, uint64_t) = NULL;
-    if (!real_fn) real_fn = resolve_next("drmSetClientCap", (void *)drmSetClientCap);
+    if (!real_fn) real_fn = hybris_resolve_next("drmSetClientCap", (void *)drmSetClientCap);
     int r = real_fn ? real_fn(fd, cap, value) : -ENOSYS;
     /* wlroots/phoc: ATOMIC + UNIVERSAL_PLANES must really be set on the fd so
      * the kernel exposes the primary/cursor planes and the atomic uAPI -- pass
@@ -257,23 +209,23 @@ int drmSetClientCap(int fd, uint64_t cap, uint64_t value) {
      * Only if the driver rejects one (e.g. because the HWC2 composer owns the
      * master) do we pretend success, so wlroots still takes the atomic path
      * where our faked drmModeAtomicCommit() works. Not for gnome/mutter. */
-    if (r != 0 && is_compositor() && !is_gnome() &&
+    if (r != 0 && hybris_is_compositor() && !hybris_is_gnome() &&
         (cap == DRM_CLIENT_CAP_ATOMIC || cap == DRM_CLIENT_CAP_UNIVERSAL_PLANES))
         return 0;
     return r;
 }
 int drmIsKMS(int fd) {
-    if (!is_compositor()) {
+    if (!hybris_is_compositor()) {
         typedef int (*fn_t)(int);
-        fn_t real=(fn_t)resolve_next("drmIsKMS",(void*)drmIsKMS);
+        fn_t real=(fn_t)hybris_resolve_next("drmIsKMS",(void*)drmIsKMS);
         return real ? real(fd) : 0;
     }
     return 1;
 }
 int drmModeCreateLease(int fd, const uint32_t *o, int n, int f, uint32_t *id) {
-    if (!is_compositor()) {
+    if (!hybris_is_compositor()) {
         typedef int (*fn_t)(int,const uint32_t*,int,int,uint32_t*);
-        fn_t real=(fn_t)resolve_next("drmModeCreateLease",(void*)drmModeCreateLease);
+        fn_t real=(fn_t)hybris_resolve_next("drmModeCreateLease",(void*)drmModeCreateLease);
         return real ? real(fd,o,n,f,id) : -EINVAL;
     }
     return -EINVAL;
@@ -287,7 +239,7 @@ int drmModeCreateLease(int fd, const uint32_t *o, int n, int f, uint32_t *id) {
 EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config,
                                EGLint attribute, EGLint *value) {
     static EGLBoolean (*real_fn)(EGLDisplay, EGLConfig, EGLint, EGLint *) = NULL;
-    if (!real_fn) real_fn = resolve_next("eglGetConfigAttrib", (void *)eglGetConfigAttrib);
+    if (!real_fn) real_fn = hybris_resolve_next("eglGetConfigAttrib", (void *)eglGetConfigAttrib);
     if (!real_fn) return EGL_FALSE;
     EGLBoolean r = real_fn(dpy, config, attribute, value);
     /* Visual-id fix is ONLY for wlroots/phoc (phosh), which needs a non-zero
@@ -296,7 +248,7 @@ EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config,
      *  - gnome/mutter -- the drmadapter EGL platform does the proper fourcc
      *    mapping itself; our forcing it to 1 breaks mutter's GBM format match
      *    ("No EGL config matching supported GBM format found"). */
-    if (r && is_compositor() && !is_gnome() &&
+    if (r && hybris_is_compositor() && !hybris_is_gnome() &&
         attribute == EGL_NATIVE_VISUAL_ID && *value == 0) {
         EGLint red=0, green=0, blue=0, alpha=0;
         real_fn(dpy,config,EGL_RED_SIZE,&red);   real_fn(dpy,config,EGL_GREEN_SIZE,&green);
@@ -314,10 +266,10 @@ typedef void *(*server_wlegl_create_t)(struct wl_display *);
 
 struct wl_display *wl_display_create(void) {
     typedef struct wl_display *(*fn_t)(void);
-    fn_t real = resolve_next("wl_display_create", (void *)wl_display_create);
+    fn_t real = hybris_resolve_next("wl_display_create", (void *)wl_display_create);
     if (!real) return NULL;
     struct wl_display *dpy = real();
-    if (dpy && is_gnome() && is_gnome_shell()) {
+    if (dpy && hybris_is_gnome() && is_gnome_shell()) {
         void *lib = dlopen("libhybris-platformcommon.so", RTLD_NOW | RTLD_NOLOAD);
         if (!lib) lib = dlopen("libhybris-platformcommon.so", RTLD_NOW);
         if (lib) {
@@ -351,7 +303,7 @@ typedef int32_t hwc2_error_t;
 hwc2_error_t hwc2_compat_display_set_vsync_enabled(hwc2_compat_display_t *display,
                                                     int32_t enabled) {
     static hwc2_error_t (*real_fn)(hwc2_compat_display_t *, int32_t) = NULL;
-    if (!real_fn) real_fn = resolve_next("hwc2_compat_display_set_vsync_enabled",
+    if (!real_fn) real_fn = hybris_resolve_next("hwc2_compat_display_set_vsync_enabled",
                                          (void *)hwc2_compat_display_set_vsync_enabled);
     if (real_fn) real_fn(display, enabled);
     return HWC2_ERROR_NONE;
@@ -365,19 +317,19 @@ hwc2_error_t hwc2_compat_display_set_vsync_enabled(hwc2_compat_display_t *displa
 typedef void HWCNativeWindow;
 void HWCNativeWindowSetBufferCount(HWCNativeWindow *win, int count) {
     static void (*real_fn)(HWCNativeWindow *, int) = NULL;
-    if (!real_fn) real_fn = resolve_next("HWCNativeWindowSetBufferCount",
+    if (!real_fn) real_fn = hybris_resolve_next("HWCNativeWindowSetBufferCount",
                                          (void *)HWCNativeWindowSetBufferCount);
     /* Only force double-buffering in the compositor. Clients keep their count. */
-    if (real_fn) real_fn(win, is_compositor() ? 2 : count);
+    if (real_fn) real_fn(win, hybris_is_compositor() ? 2 : count);
 }
 
 void HWCNativeBufferSetFence(ANativeWindowBuffer *buffer, int fd) {
     static void (*real_fn)(ANativeWindowBuffer *, int) = NULL;
-    if (!real_fn) real_fn = resolve_next("HWCNativeBufferSetFence",
+    if (!real_fn) real_fn = hybris_resolve_next("HWCNativeBufferSetFence",
                                          (void *)HWCNativeBufferSetFence);
     /* Only discard fences in the compositor. Clients need their real fence
      * preserved or buffer sync breaks (camera preview texture corruption). */
-    if (!is_compositor()) {
+    if (!hybris_is_compositor()) {
         if (real_fn) real_fn(buffer, fd);
         return;
     }
@@ -410,7 +362,7 @@ typedef int (*ioctl_t)(int, unsigned long, ...);
 static ioctl_t real_ioctl = NULL;
 int ioctl(int fd, unsigned long request, ...);
 static void ensure_real(void) {
-    if (!real_ioctl) real_ioctl = (ioctl_t)resolve_next("ioctl", (void *)ioctl);
+    if (!real_ioctl) real_ioctl = (ioctl_t)hybris_resolve_next("ioctl", (void *)ioctl);
 }
 
 /* Env-gated tracing (LIBDRM_HYBRIS_TRACE=1). */
@@ -559,7 +511,7 @@ static hwc2_present_fn hwc2_present_real(void) {
     static int tried = 0;
     if (tried) return f;
     tried = 1;
-    f = (hwc2_present_fn)resolve_next("hwc2_compat_display_present",
+    f = (hwc2_present_fn)hybris_resolve_next("hwc2_compat_display_present",
                                       (void*)hwc2_compat_display_present);
     if (!f) {
         const char *cands[] = { "libhwc2.so.1", "libhwc2.so", NULL };
@@ -687,7 +639,7 @@ static void synth_arm(uint32_t crtc, uint64_t user_data) {
 
 static uint64_t g_last_deliver_ns = 0;  /* when the last synth completion reached the compositor */
 ssize_t read(int fd, void *buf, size_t count) {
-    if (!real_read) real_read = (ssize_t(*)(int,void*,size_t))resolve_next("read",(void*)read);
+    if (!real_read) real_read = (ssize_t(*)(int,void*,size_t))hybris_resolve_next("read",(void*)read);
     if (!g_synth_active || fd != g_drm_fd || g_synth_qn <= 0 || in_hook)
         return real_read(fd, buf, count);
     if (count < sizeof(struct drm_event_vblank)) return real_read(fd, buf, count);
@@ -753,7 +705,7 @@ static int synth_poll_fixup(struct pollfd *fds, nfds_t n) {
     return -1;
 }
 int poll(struct pollfd *fds, nfds_t n, int timeout) {
-    if (!real_poll) real_poll = (int(*)(struct pollfd*,nfds_t,int))resolve_next("poll",(void*)poll);
+    if (!real_poll) real_poll = (int(*)(struct pollfd*,nfds_t,int))hybris_resolve_next("poll",(void*)poll);
     if (!g_synth_active || in_hook) return real_poll(fds, n, timeout);
     if (synth_poll_fixup(fds, n) >= 0) return 1;
     int got = real_poll(fds, n, timeout);
@@ -763,7 +715,7 @@ int poll(struct pollfd *fds, nfds_t n, int timeout) {
     return got;
 }
 int ppoll(struct pollfd *fds, nfds_t n, const struct timespec *to, const sigset_t *ss) {
-    if (!real_ppoll) real_ppoll = (int(*)(struct pollfd*,nfds_t,const struct timespec*,const sigset_t*))resolve_next("ppoll",(void*)ppoll);
+    if (!real_ppoll) real_ppoll = (int(*)(struct pollfd*,nfds_t,const struct timespec*,const sigset_t*))hybris_resolve_next("ppoll",(void*)ppoll);
     if (!g_synth_active || in_hook) return real_ppoll(fds, n, to, ss);
     if (synth_poll_fixup(fds, n) >= 0) return 1;
     int got = real_ppoll(fds, n, to, ss);
@@ -790,9 +742,9 @@ static int fd_is_drm(int fd) {
 }
 
 int epoll_ctl(int epfd, int op, int fd, struct epoll_event *ev) {
-    if (!real_epoll_ctl) real_epoll_ctl = (int(*)(int,int,int,struct epoll_event*))resolve_next("epoll_ctl",(void*)epoll_ctl);
+    if (!real_epoll_ctl) real_epoll_ctl = (int(*)(int,int,int,struct epoll_event*))hybris_resolve_next("epoll_ctl",(void*)epoll_ctl);
     int r = real_epoll_ctl(epfd, op, fd, ev);
-    if (is_compositor() && ev && (op == EPOLL_CTL_ADD || op == EPOLL_CTL_MOD) && fd_is_drm(fd)) {
+    if (hybris_is_compositor() && ev && (op == EPOLL_CTL_ADD || op == EPOLL_CTL_MOD) && fd_is_drm(fd)) {
         g_epoll_fd = epfd; g_drm_epoll_data = ev->data; g_drm_epoll_valid = 1;
         if (g_drm_fd < 0) g_drm_fd = fd;
         /* Add our private wake eventfd to the SAME epoll so synth_arm() can make
@@ -831,7 +783,7 @@ static int epoll_synth(int epfd, struct epoll_event *events, int n, int maxevent
     /* Drain + hide our private wake eventfd: wl_event_loop would deref its
      * data.ptr as a wl_event_source and crash, so it must never leak out. */
     if (g_wake_fd >= 0 || g_timer_fd >= 0) {
-        if (!real_read) real_read = (ssize_t(*)(int,void*,size_t))resolve_next("read",(void*)read);
+        if (!real_read) real_read = (ssize_t(*)(int,void*,size_t))hybris_resolve_next("read",(void*)read);
         for (int i = 0; i < n; ) {
             if (events[i].data.ptr == (void *)&g_wake_fd) {
                 uint64_t v; int sv = in_hook; in_hook = 1;
@@ -869,14 +821,14 @@ static int epoll_cap_timeout(int timeout) {
 }
 
 int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout) {
-    if (!real_epoll_wait) real_epoll_wait = (int(*)(int,struct epoll_event*,int,int))resolve_next("epoll_wait",(void*)epoll_wait);
+    if (!real_epoll_wait) real_epoll_wait = (int(*)(int,struct epoll_event*,int,int))hybris_resolve_next("epoll_wait",(void*)epoll_wait);
     if (!g_synth_active || in_hook || epfd != g_epoll_fd || !g_drm_epoll_valid)
         return real_epoll_wait(epfd, events, maxevents, timeout);
     int n = real_epoll_wait(epfd, events, maxevents, epoll_cap_timeout(timeout));
     return epoll_synth(epfd, events, n, maxevents);
 }
 int epoll_pwait(int epfd, struct epoll_event *events, int maxevents, int timeout, const sigset_t *ss) {
-    if (!real_epoll_pwait) real_epoll_pwait = (int(*)(int,struct epoll_event*,int,int,const sigset_t*))resolve_next("epoll_pwait",(void*)epoll_pwait);
+    if (!real_epoll_pwait) real_epoll_pwait = (int(*)(int,struct epoll_event*,int,int,const sigset_t*))hybris_resolve_next("epoll_pwait",(void*)epoll_pwait);
     if (!g_synth_active || in_hook || epfd != g_epoll_fd || !g_drm_epoll_valid)
         return real_epoll_pwait(epfd, events, maxevents, timeout, ss);
     int n = real_epoll_pwait(epfd, events, maxevents, epoll_cap_timeout(timeout), ss);
@@ -884,7 +836,7 @@ int epoll_pwait(int epfd, struct epoll_event *events, int maxevents, int timeout
 }
 static int (*real_epoll_pwait2)(int,struct epoll_event*,int,const struct timespec*,const sigset_t*) = NULL;
 int epoll_pwait2(int epfd, struct epoll_event *events, int maxevents, const struct timespec *to, const sigset_t *ss) {
-    if (!real_epoll_pwait2) real_epoll_pwait2 = (int(*)(int,struct epoll_event*,int,const struct timespec*,const sigset_t*))resolve_next("epoll_pwait2",(void*)epoll_pwait2);
+    if (!real_epoll_pwait2) real_epoll_pwait2 = (int(*)(int,struct epoll_event*,int,const struct timespec*,const sigset_t*))hybris_resolve_next("epoll_pwait2",(void*)epoll_pwait2);
     if (!g_synth_active || in_hook || epfd != g_epoll_fd || !g_drm_epoll_valid)
         return real_epoll_pwait2(epfd, events, maxevents, to, ss);
     struct timespec cap; const struct timespec *eff = to;
@@ -1349,14 +1301,14 @@ void drm_shim_panel_power(int on);   /* defined below */
  * are untouched. DPMS values: 0=On, 3=Off. */
 int drmModeConnectorSetProperty(int fd, uint32_t connector_id, uint32_t property_id, uint64_t value) {
     typedef int (*fn_t)(int,uint32_t,uint32_t,uint64_t);
-    fn_t real=(fn_t)resolve_next("drmModeConnectorSetProperty",(void*)drmModeConnectorSetProperty);
+    fn_t real=(fn_t)hybris_resolve_next("drmModeConnectorSetProperty",(void*)drmModeConnectorSetProperty);
     static int drive = -1;
     if (drive < 0) drive = getenv("LIBDRM_HYBRIS_DPMS_FROM_ACTIVE") ? 1 : 0;
     if (getenv("LIBDRM_HYBRIS_SAMPLE"))
         fprintf(stderr, "libdrm-hybris: ConnectorSetProperty conn=%u prop=%u val=%llu drive=%d comp=%d\n",
-                connector_id, property_id, (unsigned long long)value, drive, is_compositor());
-    if (drive && is_compositor() && !is_gnome() && g_drm_fd < 0) g_drm_fd = fd;
-    if (drive && is_compositor() && !is_gnome()) {
+                connector_id, property_id, (unsigned long long)value, drive, hybris_is_compositor());
+    if (drive && hybris_is_compositor() && !hybris_is_gnome() && g_drm_fd < 0) g_drm_fd = fd;
+    if (drive && hybris_is_compositor() && !hybris_is_gnome()) {
         int sv = in_hook; in_hook = 1;
         drmModePropertyPtr p = drmModeGetProperty(fd, property_id);
         int is_dpms = (p && strcmp(p->name, "DPMS") == 0);
@@ -1380,10 +1332,10 @@ int drmModeConnectorSetProperty(int fd, uint32_t connector_id, uint32_t property
 int drmModeObjectSetProperty(int fd, uint32_t object_id, uint32_t object_type,
                              uint32_t property_id, uint64_t value) {
     typedef int (*fn_t)(int,uint32_t,uint32_t,uint32_t,uint64_t);
-    fn_t real=(fn_t)resolve_next("drmModeObjectSetProperty",(void*)drmModeObjectSetProperty);
+    fn_t real=(fn_t)hybris_resolve_next("drmModeObjectSetProperty",(void*)drmModeObjectSetProperty);
     static int drive = -1;
     if (drive < 0) drive = getenv("LIBDRM_HYBRIS_DPMS_FROM_ACTIVE") ? 1 : 0;
-    if (drive && is_compositor() && !is_gnome()) {
+    if (drive && hybris_is_compositor() && !hybris_is_gnome()) {
         if (g_drm_fd < 0) g_drm_fd = fd;
         int sv = in_hook; in_hook = 1;
         drmModePropertyPtr p = drmModeGetProperty(fd, property_id);
@@ -1404,10 +1356,10 @@ int drmModeObjectSetProperty(int fd, uint32_t object_id, uint32_t object_type,
 int drmModeAddFB2WithModifiers(int fd, uint32_t w, uint32_t h, uint32_t fmt,
     const uint32_t handles[4], const uint32_t pitches[4], const uint32_t offsets[4],
     const uint64_t mod[4], uint32_t *buf_id, uint32_t flags) {
-    if (!is_compositor()) {
+    if (!hybris_is_compositor()) {
         typedef int (*fn_t)(int,uint32_t,uint32_t,uint32_t,const uint32_t*,
                             const uint32_t*,const uint32_t*,const uint64_t*,uint32_t*,uint32_t);
-        fn_t real=(fn_t)resolve_next("drmModeAddFB2WithModifiers",
+        fn_t real=(fn_t)hybris_resolve_next("drmModeAddFB2WithModifiers",
                                      (void*)drmModeAddFB2WithModifiers);
         return real ? real(fd,w,h,fmt,handles,pitches,offsets,mod,buf_id,flags) : -ENOSYS;
     }
@@ -1426,9 +1378,9 @@ int drmModeAddFB2WithModifiers(int fd, uint32_t w, uint32_t h, uint32_t fmt,
 int drmModeAddFB(int fd, uint32_t w, uint32_t h, uint8_t depth, uint8_t bpp,
                  uint32_t pitch, uint32_t bo_handle, uint32_t *buf_id) {
     TRACEALL("drmModeAddFB");
-    if (!is_compositor() || !fake_kms_state()) {
+    if (!hybris_is_compositor() || !fake_kms_state()) {
         typedef int (*fn_t)(int,uint32_t,uint32_t,uint8_t,uint8_t,uint32_t,uint32_t,uint32_t*);
-        fn_t real=(fn_t)resolve_next("drmModeAddFB",(void*)drmModeAddFB);
+        fn_t real=(fn_t)hybris_resolve_next("drmModeAddFB",(void*)drmModeAddFB);
         return real ? real(fd,w,h,depth,bpp,pitch,bo_handle,buf_id) : -ENOSYS;
     }
     if (!frame_w) { frame_w=w; frame_h=h; }
@@ -1444,10 +1396,10 @@ int drmModeAddFB2(int fd, uint32_t w, uint32_t h, uint32_t fmt,
     const uint32_t handles[4], const uint32_t pitches[4], const uint32_t offsets[4],
     uint32_t *buf_id, uint32_t flags) {
     TRACEALL("drmModeAddFB2");
-    if (!is_compositor()) {
+    if (!hybris_is_compositor()) {
         typedef int (*fn_t)(int,uint32_t,uint32_t,uint32_t,const uint32_t*,
                             const uint32_t*,const uint32_t*,uint32_t*,uint32_t);
-        fn_t real=(fn_t)resolve_next("drmModeAddFB2",(void*)drmModeAddFB2);
+        fn_t real=(fn_t)hybris_resolve_next("drmModeAddFB2",(void*)drmModeAddFB2);
         return real ? real(fd,w,h,fmt,handles,pitches,offsets,buf_id,flags) : -ENOSYS;
     }
     if (!frame_w) { frame_w=w; frame_h=h; }
@@ -1460,8 +1412,8 @@ int drmModeAddFB2(int fd, uint32_t w, uint32_t h, uint32_t fmt,
 }
 int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle) {
     typedef int (*fn_t)(int,int,uint32_t*);
-    fn_t real=(fn_t)resolve_next("drmPrimeFDToHandle",(void*)drmPrimeFDToHandle);
-    if (!is_compositor() || is_gnome())
+    fn_t real=(fn_t)hybris_resolve_next("drmPrimeFDToHandle",(void*)drmPrimeFDToHandle);
+    if (!hybris_is_compositor() || hybris_is_gnome())
         return real ? real(fd,prime_fd,handle) : -ENOSYS;
     int r = real ? real(fd,prime_fd,handle) : -EACCES;
     /* wlroots imports the gbm_bo's PRIME fd for scan-out, which needs DRM
@@ -1482,8 +1434,8 @@ int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle) {
  * hatch from the Mali/hybris GL-render corruption. */
 int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd) {
     typedef int (*fn_t)(int,uint32_t,uint32_t,int*);
-    fn_t real=(fn_t)resolve_next("drmPrimeHandleToFD",(void*)drmPrimeHandleToFD);
-    if (!is_compositor() || is_gnome())
+    fn_t real=(fn_t)hybris_resolve_next("drmPrimeHandleToFD",(void*)drmPrimeHandleToFD);
+    if (!hybris_is_compositor() || hybris_is_gnome())
         return real ? real(fd,handle,flags,prime_fd) : -ENOSYS;
     /* Memfd-backed fake dumb buffer: "export" the memfd itself. */
     if (KDUMB_IS_FAKE(handle) && prime_fd) {
@@ -1504,9 +1456,9 @@ int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd) {
 }
 int drmModeRmFB(int fd, uint32_t id) {
     TRACEALL("drmModeRmFB");
-    if (!is_compositor()) {
+    if (!hybris_is_compositor()) {
         typedef int (*fn_t)(int,uint32_t);
-        fn_t real=(fn_t)resolve_next("drmModeRmFB",(void*)drmModeRmFB);
+        fn_t real=(fn_t)hybris_resolve_next("drmModeRmFB",(void*)drmModeRmFB);
         return real ? real(fd,id) : 0;
     }
     return 0;
@@ -1514,9 +1466,9 @@ int drmModeRmFB(int fd, uint32_t id) {
 int drmModeSetCrtc(int fd, uint32_t crtcId, uint32_t bufferId, uint32_t x, uint32_t y,
     uint32_t *connectors, int count, drmModeModeInfoPtr mode) {
     TRACEALL("drmModeSetCrtc");
-    if (!is_compositor()) {
+    if (!hybris_is_compositor()) {
         typedef int (*fn_t)(int,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t*,int,drmModeModeInfoPtr);
-        fn_t real=(fn_t)resolve_next("drmModeSetCrtc",(void*)drmModeSetCrtc);
+        fn_t real=(fn_t)hybris_resolve_next("drmModeSetCrtc",(void*)drmModeSetCrtc);
         return real ? real(fd,crtcId,bufferId,x,y,connectors,count,mode) : -ENOSYS;
     }
     if (!dumb_map) init_dumb(fd);
@@ -1543,8 +1495,8 @@ int drmModeSetCrtc(int fd, uint32_t crtcId, uint32_t bufferId, uint32_t x, uint3
 int drmModePageFlip(int fd, uint32_t crtc_id, uint32_t fb_id, uint32_t flags, void *ud) {
     TRACEALL("drmModePageFlip");
     typedef int (*fn_t)(int,uint32_t,uint32_t,uint32_t,void*);
-    fn_t real=(fn_t)resolve_next("drmModePageFlip",(void*)drmModePageFlip);
-    if (!is_compositor())
+    fn_t real=(fn_t)hybris_resolve_next("drmModePageFlip",(void*)drmModePageFlip);
+    if (!hybris_is_compositor())
         return real ? real(fd,crtc_id,fb_id,flags,ud) : -ENOSYS;
     g_drm_fd = fd; synth_note_flip();
     buffer_handle_t h=find_by_fb(fb_id);
@@ -1579,7 +1531,7 @@ EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config,
                             EGLContext share_context, const EGLint *attrib_list) {
     typedef EGLContext (*fn_t)(EGLDisplay, EGLConfig, EGLContext, const EGLint *);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)resolve_next("eglCreateContext", (void *)eglCreateContext);
+    if (!real) real = (fn_t)hybris_resolve_next("eglCreateContext", (void *)eglCreateContext);
     if (!real) return EGL_NO_CONTEXT;
 
     static int force = -1;
@@ -1696,7 +1648,7 @@ static void panel_ctl_start(void) {
      * 1125 of them in one boot) spawns a polling thread that can only ever call
      * setPowerMode with a NULL handle. A battery fix should not ship idle
      * pollers in every process on the system. */
-    if (!is_compositor()) return;
+    if (!hybris_is_compositor()) return;
     pthread_t t;
     if (pthread_create(&t, NULL, panel_ctl_thread, NULL) == 0)
         pthread_detach(t);
@@ -1718,7 +1670,7 @@ void drm_shim_panel_power(int on) {
         static hwc2_error_t (*set_pm)(void *, int32_t) = NULL;
         static int resolved = 0;
         if (!resolved) {
-            set_pm = resolve_next("hwc2_compat_display_set_power_mode", NULL);
+            set_pm = hybris_resolve_next("hwc2_compat_display_set_power_mode", NULL);
             if (!set_pm) set_pm = dlsym(RTLD_DEFAULT, "hwc2_compat_display_set_power_mode");
             resolved = 1;
             if (getenv("LIBDRM_HYBRIS_PANEL_CTL_DEBUG"))
@@ -1737,8 +1689,8 @@ void drm_shim_panel_power(int on) {
 int drm_shim_panel_is_on(void) { return g_output_on; }
 int drmModeAtomicAddProperty(drmModeAtomicReqPtr req, uint32_t obj, uint32_t prop, uint64_t val) {
     typedef int (*fn_t)(drmModeAtomicReqPtr,uint32_t,uint32_t,uint64_t);
-    fn_t real = (fn_t)resolve_next("drmModeAtomicAddProperty",(void*)drmModeAtomicAddProperty);
-    if (is_compositor() && g_drm_fd >= 0 && !in_hook) {
+    fn_t real = (fn_t)hybris_resolve_next("drmModeAtomicAddProperty",(void*)drmModeAtomicAddProperty);
+    if (hybris_is_compositor() && g_drm_fd >= 0 && !in_hook) {
         if (!g_fbid_prop || !g_crtcid_prop || !g_infence_learned || !g_active_prop) { /* learn prop ids (device-global) */
             in_hook = 1;
             drmModePropertyPtr p = drmModeGetProperty(g_drm_fd, prop);
@@ -1768,9 +1720,9 @@ int drmModeAtomicAddProperty(drmModeAtomicReqPtr req, uint32_t obj, uint32_t pro
 
 int drmModeAtomicCommit(int fd, drmModeAtomicReqPtr req, uint32_t flags, void *ud) {
     TRACEALL("drmModeAtomicCommit flags=0x%x", flags);
-    if (!is_compositor()) {
+    if (!hybris_is_compositor()) {
         typedef int (*fn_t)(int,drmModeAtomicReqPtr,uint32_t,void*);
-        fn_t real=(fn_t)resolve_next("drmModeAtomicCommit",(void*)drmModeAtomicCommit);
+        fn_t real=(fn_t)hybris_resolve_next("drmModeAtomicCommit",(void*)drmModeAtomicCommit);
         return real ? real(fd,req,flags,ud) : -ENOSYS;
     }
     /* Atomic check (TEST_ONLY): just report the config valid, present nothing. */
@@ -1819,7 +1771,7 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReqPtr req, uint32_t flags, void *u
              * copy and must NOT also do this (the write-usage lock's AFBC
              * writeback races the presenter). */
             if (e) dc = (*e == '1') ? 1 : 0;
-            else   dc = is_gnome() ? 1 : 0;
+            else   dc = hybris_is_gnome() ? 1 : 0;
         }
         if (dc) copy_to_dumb(h);
         present_hwc2(h);
@@ -1859,7 +1811,7 @@ int ioctl(int fd, unsigned long request, ...) {
     if (magic != 0x64) return real_ioctl(fd,request,arg);
     /* Only the compositor's DRM ioctls drive the fake KMS framebuffer.
      * Client processes (camera etc) must reach the real DRM driver intact. */
-    if (!is_compositor()) return real_ioctl(fd,request,arg);
+    if (!hybris_is_compositor()) return real_ioctl(fd,request,arg);
     if (in_hook) return real_ioctl(fd,request,arg);
     uint32_t nr=request&0xff;
     in_hook=1; int ret;
