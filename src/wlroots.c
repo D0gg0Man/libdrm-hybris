@@ -72,6 +72,7 @@ struct libseat *libseat_open_seat(const struct libseat_seat_listener *l, void *u
     return (struct libseat *)&_fake_seat;
 }
 int libseat_open_device(struct libseat *s, const char *path, int *fd) {
+    (void)s;   /* the fake seat is a singleton; the handle carries no state */
     /* O_NONBLOCK is critical -- without it the GLib main loop blocks in
      * evdev_read and the wlroots frame timer callbacks never fire. */
     int f = open(path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
@@ -83,16 +84,17 @@ int libseat_open_device(struct libseat *s, const char *path, int *fd) {
     return id;
 }
 int libseat_close_device(struct libseat *s, int id) {
+    (void)s;
     int fd = get_fd_for_device(id);
     if (fd >= 0) { close(fd); untrack_device(id); }
     return 0;
 }
 int         libseat_get_fd(struct libseat *s)                { return ((struct fake_seat *)s)->pipe_r; }
-int         libseat_dispatch(struct libseat *s, int t)       { return 0; }
-const char *libseat_seat_name(struct libseat *s)             { return "seat0"; }
-int         libseat_close_seat(struct libseat *s)            { return 0; }
-int         libseat_switch_session(struct libseat *s, int n) { return 0; }
-int         libseat_disable_seat(struct libseat *s)          { return 0; }
+int         libseat_dispatch(struct libseat *s, int t)       { (void)s; (void)t; return 0; }
+const char *libseat_seat_name(struct libseat *s)             { (void)s; return "seat0"; }
+int         libseat_close_seat(struct libseat *s)            { (void)s; return 0; }
+int         libseat_switch_session(struct libseat *s, int n) { (void)s; (void)n; return 0; }
+int         libseat_disable_seat(struct libseat *s)          { (void)s; return 0; }
 void        libseat_set_log_handler(void *handler, void *data) { (void)handler; (void)data; }
 void        libseat_set_log_level(int level)                 { (void)level; }
 
