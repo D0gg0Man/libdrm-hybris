@@ -17,6 +17,10 @@ HYBRIS_INTERNAL struct hybris_debug_flags   hybris_debug;
 HYBRIS_INTERNAL struct hybris_buffer_registry hybris_buffers = { .next_fake_fb_id = 0x80000000u };
 HYBRIS_INTERNAL struct hybris_dumb_buffer     hybris_dumb;
 HYBRIS_INTERNAL struct hybris_frame_geometry  hybris_frame;
+HYBRIS_INTERNAL struct hybris_tuning hybris_tuning = {
+    .touch_sync = true,
+    .row_step   = 64,
+};
 
 /* ---- logging ------------------------------------------------------------ */
 
@@ -57,6 +61,19 @@ hybris_common_init (void)
     hybris_debug.trace   = getenv ("LIBDRM_HYBRIS_TRACE") != NULL;
     hybris_debug.sample  = getenv ("LIBDRM_HYBRIS_SAMPLE") != NULL;
     hybris_debug.profile = getenv ("LIBDRM_HYBRIS_PROF") != NULL;
+    /* Overrides only. Both default to the fast, measured path above. */
+    const char *sync = getenv ("LIBDRM_HYBRIS_SYNC");
+    const char *step = getenv ("LIBDRM_HYBRIS_ROWSTEP");
+
+    if (sync && strcmp (sync, "copy") == 0)
+        hybris_tuning.touch_sync = false;
+    if (step) {
+        int n = atoi (step);
+
+        if (n >= 1)
+            hybris_tuning.row_step = n;
+    }
+
     hybris_debug.log_enabled = hybris_debug.trace ||
                                hybris_debug.sample ||
                                hybris_debug.profile ||
@@ -126,6 +143,29 @@ hybris_is_compositor (void)
     if (!cached && strstr (base, "kwin"))
         cached = 1;
 
+    return cached;
+}
+
+HYBRIS_INTERNAL bool
+hybris_is_kwin (void)
+{
+    static int cached = -1;
+
+    if (cached < 0)
+        cached = strstr (process_basename (), "kwin") != NULL;
+    return cached;
+}
+
+HYBRIS_INTERNAL bool
+hybris_is_wlroots (void)
+{
+    static int cached = -1;
+    const char *base;
+
+    if (cached < 0) {
+        base = process_basename ();
+        cached = (strcmp (base, "phoc") == 0 || strcmp (base, "wlroots") == 0);
+    }
     return cached;
 }
 

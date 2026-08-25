@@ -368,7 +368,7 @@ static void ensure_real(void) {
 /* Env-gated tracing (LIBDRM_HYBRIS_TRACE=1). */
 static int trace_on = -1;
 static void tracef(const char *fmt, ...) {
-    if (trace_on < 0) trace_on = getenv("LIBDRM_HYBRIS_TRACE") ? 1 : 0;
+    if (trace_on < 0) trace_on = hybris_debug.trace ? 1 : 0;
     if (!trace_on) return;
     int saved = in_hook; in_hook = 1;
     FILE *f = fopen("/tmp/libdrm-hybris-trace.log", "a");
@@ -577,7 +577,11 @@ int hwc2_compat_display_present(void *display, int32_t *out_fence) {
  * bring-up. Opt-in so only the KWin session changes behaviour. */
 static int fake_kms_state(void) {
     static int f = -1;
-    if (f < 0) f = getenv("LIBDRM_HYBRIS_FAKE_KMS_STATE") ? 1 : 0;
+    /* KWin's legacy-KMS path needs the faked state; phoc and mutter must see
+     * the real ioctl results. Detected rather than declared, with an env
+     * override for bringing up a compositor this does not recognise. */
+    if (f < 0)
+        f = hybris_is_kwin() || getenv("LIBDRM_HYBRIS_FAKE_KMS_STATE") ? 1 : 0;
     return f;
 }
 static void synth_arm(uint32_t crtc, uint64_t user_data) {
@@ -616,7 +620,7 @@ static void synth_arm(uint32_t crtc, uint64_t user_data) {
     }
     g_synth_qn++;
     g_synth_active = 1;
-    if (getenv("LIBDRM_HYBRIS_SAMPLE")) {
+    if (hybris_debug.sample) {
         static unsigned long a = 0;
         if (a++ < 10)
             fprintf(stderr, "libdrm-hybris: synth_arm #%lu crtc=%u qn=%d timer=%d wake=%d\n",
@@ -676,7 +680,7 @@ ssize_t read(int fd, void *buf, size_t count) {
     ev.tv_sec  = (uint32_t)(ts / 1000000000ull);
     ev.tv_usec = (uint32_t)((ts / 1000ull) % 1000000ull);
     ev.sequence = ++g_synth_seq;
-    if (getenv("LIBDRM_HYBRIS_SAMPLE")) {
+    if (hybris_debug.sample) {
         static unsigned long d = 0;
         if (d++ < 10)
             fprintf(stderr, "libdrm-hybris: synth deliver #%lu seq=%u\n", d, g_synth_seq);
@@ -769,7 +773,7 @@ int epoll_ctl(int epfd, int op, int fd, struct epoll_event *ev) {
                 }
             }
         }
-        if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+        if (hybris_debug.sample)
             fprintf(stderr, "libdrm-hybris: epoll_ctl tracked DRM fd=%d epfd=%d data=0x%llx\n",
                     fd, epfd, (unsigned long long)ev->data.u64);
     }
@@ -891,7 +895,7 @@ static int g_wlroots = -1;
 static int (*g_present_fn)(buffer_handle_t) = NULL;
 void drm_shim_set_present(int (*fn)(buffer_handle_t)) {
     g_present_fn = fn;
-    if (getenv("LIBDRM_HYBRIS_SAMPLE")) fprintf(stderr, "libdrm-hybris: present callback registered fn=%p\n", (void*)fn);
+    if (hybris_debug.sample) fprintf(stderr, "libdrm-hybris: present callback registered fn=%p\n", (void*)fn);
 }
 /* Single-pass CPU present (QPainter/software compositors): drmadapter copies
  * the dumb-buffer mapping straight into its present buffer, skipping the
@@ -899,7 +903,7 @@ void drm_shim_set_present(int (*fn)(buffer_handle_t)) {
 static int (*g_present_cpu_fn)(const void *, uint32_t) = NULL;
 void drm_shim_set_present_cpu(int (*fn)(const void *, uint32_t)) {
     g_present_cpu_fn = fn;
-    if (getenv("LIBDRM_HYBRIS_SAMPLE")) fprintf(stderr, "libdrm-hybris: cpu present callback registered fn=%p\n", (void*)fn);
+    if (hybris_debug.sample) fprintf(stderr, "libdrm-hybris: cpu present callback registered fn=%p\n", (void*)fn);
 }
 /* drmadapter also registers a power callback so we can drive the real HWC2
  * display power off/on when wlroots toggles the CRTC ACTIVE state (DPMS). The
@@ -911,7 +915,7 @@ void drm_shim_set_present_cpu(int (*fn)(const void *, uint32_t)) {
 static void (*g_power_fn)(int) = NULL;
 void drm_shim_set_power(void (*fn)(int)) {
     g_power_fn = fn;
-    if (getenv("LIBDRM_HYBRIS_SAMPLE")) fprintf(stderr, "libdrm-hybris: power callback registered fn=%p\n", (void*)fn);
+    if (hybris_debug.sample) fprintf(stderr, "libdrm-hybris: power callback registered fn=%p\n", (void*)fn);
 }
 /* wlroots' render-completion fence for the current commit (the plane's
  * IN_FENCE_FD). We fake the KMS commit, so the kernel never waits on it -- we
@@ -919,7 +923,8 @@ void drm_shim_set_power(void (*fn)(int)) {
  * Captured in drmModeAtomicAddProperty; consumed (waited + closed) here. */
 static int g_committed_fence = -1;
 static void present_hwc2(buffer_handle_t h) {
-    if (g_wlroots < 0) g_wlroots = getenv("HYBRIS_WLROOTS") ? 1 : 0;
+    if (g_wlroots < 0)
+        g_wlroots = hybris_is_wlroots() || getenv("HYBRIS_WLROOTS") ? 1 : 0;
     if (!g_wlroots || !h || !g_present_fn) {
         if (g_committed_fence >= 0) { close(g_committed_fence); g_committed_fence = -1; }
         return;
@@ -933,12 +938,12 @@ static void present_hwc2(buffer_handle_t h) {
         real_poll ? real_poll(&pfd, 1, 1000) : poll(&pfd, 1, 1000);
         in_hook = saved;
         static int logged = 0;
-        if (!logged && getenv("LIBDRM_HYBRIS_SAMPLE")) { fprintf(stderr, "libdrm-hybris: waited on IN_FENCE_FD %d\n", g_committed_fence); logged = 1; }
+        if (!logged && hybris_debug.sample) { fprintf(stderr, "libdrm-hybris: waited on IN_FENCE_FD %d\n", g_committed_fence); logged = 1; }
         close(g_committed_fence); g_committed_fence = -1;
     }
     int rc = g_present_fn(h);
     static int logged2 = 0;
-    if (!logged2 && getenv("LIBDRM_HYBRIS_SAMPLE")) { fprintf(stderr, "libdrm-hybris: first present_hwc2(h=%p) rc=%d\n", (void*)h, rc); logged2 = 1; }
+    if (!logged2 && hybris_debug.sample) { fprintf(stderr, "libdrm-hybris: first present_hwc2(h=%p) rc=%d\n", (void*)h, rc); logged2 = 1; }
     (void)rc;
 }
 static int fmap_evict = 0;
@@ -1018,9 +1023,7 @@ static void pacestat(void) {
  * resolve, not the traversal: touching one cache line every ROWSTEP rows gives
  * the same result for ~450 us (69x). LIBDRM_HYBRIS_SYNC=touch selects it. */
 static int sync_mode_touch(void) {
-    static int m = -1;
-    if (m < 0) { const char *e = getenv("LIBDRM_HYBRIS_SYNC"); m = (e && !strcmp(e,"touch")) ? 1 : 0; }
-    return m;
+    return hybris_tuning.touch_sync;
 }
 static void copy_to_dumb(buffer_handle_t h) {
     if (!dumb_map || !h || !frame_w || !frame_h) return;
@@ -1040,7 +1043,7 @@ static void copy_to_dumb(buffer_handle_t h) {
     uint8_t *d = dumb_map, *s = src;
     if (touch) {
         static int rowstep = -1;
-        if (rowstep < 0) { const char *e = getenv("LIBDRM_HYBRIS_ROWSTEP"); rowstep = e ? atoi(e) : 1; if (rowstep < 1) rowstep = 1; }
+        if (rowstep < 0) rowstep = hybris_tuning.row_step;
         volatile uint32_t acc = 0;
         for (uint32_t y = 0; y < frame_h; y += (uint32_t)rowstep) {
             const uint32_t *row = (const uint32_t *)(s + (size_t)y * dumb_pitch);
@@ -1055,7 +1058,7 @@ static void copy_to_dumb(buffer_handle_t h) {
     }
     clock_gettime(CLOCK_MONOTONIC, &t2);
     /* Diagnostic: is the committed buffer actually non-black? Sample a grid. */
-    if (getenv("LIBDRM_HYBRIS_SAMPLE")) {
+    if (hybris_debug.sample) {
         unsigned long nz = 0; uint32_t cx = frame_w/2, cy = frame_h/2;
         for (uint32_t y = 0; y < frame_h; y += 64)
             for (uint32_t x = 0; x < frame_w; x += 64) {
@@ -1156,7 +1159,7 @@ static int kdumb_create_memfd(struct drm_mode_create_dumb *cd) {
     cd->handle = kdumb[slot].gem;
     cd->pitch = pitch;
     cd->size = size;
-    if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+    if (hybris_debug.sample)
         fprintf(stderr, "libdrm-hybris: kdumb memfd create %ux%u gem=0x%x fd=%d (cached)\n",
                 cd->width, cd->height, cd->handle, mfd);
     return 0;
@@ -1187,7 +1190,7 @@ void *mmap64(void *addr, size_t length, int prot, int flags, int fd, off_t offse
 static buffer_handle_t g_qp_gralloc = NULL;
 static uint32_t g_qp_stride = 0;
 static void kdumb_note_create(uint32_t gem, size_t size, uint32_t pitch) {
-    if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+    if (hybris_debug.sample)
         fprintf(stderr, "libdrm-hybris: kdumb_create gem=%u size=%zu pitch=%u\n", gem, size, pitch);
     for (int i=0;i<kdumb_n;i++) if (kdumb[i].gem==gem){ kdumb[i].size=size; kdumb[i].pitch=pitch; kdumb[i].cpu=NULL; return; }
     if (kdumb_n<KDUMB_MAX){ kdumb[kdumb_n].gem=gem; kdumb[kdumb_n].cpu=NULL; kdumb[kdumb_n].size=size; kdumb[kdumb_n].pitch=pitch; kdumb_n++; }
@@ -1199,13 +1202,13 @@ static void kdumb_note_map(int fd, uint32_t gem, uint64_t offset) {
             void *m = mmap(NULL, kdumb[i].size, PROT_READ, MAP_SHARED, fd, (off_t)offset);
             in_hook=sv;
             if (m!=MAP_FAILED) kdumb[i].cpu=m;
-            if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+            if (hybris_debug.sample)
                 fprintf(stderr, "libdrm-hybris: kdumb_map gem=%u size=%zu off=0x%llx -> %p (errno=%d)\n",
                         gem, kdumb[i].size, (unsigned long long)offset, m, errno);
         }
         return;
     }
-    if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+    if (hybris_debug.sample)
         fprintf(stderr, "libdrm-hybris: kdumb_map gem=%u NOT in kdumb (n=%d)\n", gem, kdumb_n);
 }
 /* KWin exports each dumb buffer with drmPrimeHandleToFD (dumb gem -> fd) and
@@ -1249,13 +1252,13 @@ static void ensure_present_fn(void) {
         }
     }
     in_hook = sv;
-    if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+    if (hybris_debug.sample)
         fprintf(stderr, "libdrm-hybris: forced drmadapter EGL init, present_fn=%p\n", (void *)g_present_fn);
 }
 static int present_qpainter_dumb(uint32_t gem) {
     uint32_t spitch=0;
     void *src = kdumb_cpu(gem, &spitch);
-    if (getenv("LIBDRM_HYBRIS_SAMPLE")) {
+    if (hybris_debug.sample) {
         static int n=0;
         if (n++ < 5) fprintf(stderr, "libdrm-hybris: present_qpainter_dumb(gem=%u) src=%p kdumb_n=%d fw=%u\n",
                              gem, src, kdumb_n, frame_w);
@@ -1297,14 +1300,16 @@ void drm_shim_panel_power(int on);   /* defined below */
  * the connector "DPMS" property, which needs DRM master (HWC2 owns it) and
  * returns EACCES -> the panel never blanks (lit black screen when locked/idle).
  * Intercept it and drive the HWC2 backlight via drm_shim_panel_power() instead.
- * Env-gated (LIBDRM_HYBRIS_DPMS_FROM_ACTIVE, the KWin session) so phoc/mutter
- * are untouched. DPMS values: 0=On, 3=Off. */
+ * Applies to KWin only (detected from the process name) so phoc and mutter are
+ * untouched; LIBDRM_HYBRIS_DPMS_FROM_ACTIVE forces it on for a compositor this
+ * does not recognise. DPMS values: 0=On, 3=Off. */
 int drmModeConnectorSetProperty(int fd, uint32_t connector_id, uint32_t property_id, uint64_t value) {
     typedef int (*fn_t)(int,uint32_t,uint32_t,uint64_t);
     fn_t real=(fn_t)hybris_resolve_next("drmModeConnectorSetProperty",(void*)drmModeConnectorSetProperty);
     static int drive = -1;
-    if (drive < 0) drive = getenv("LIBDRM_HYBRIS_DPMS_FROM_ACTIVE") ? 1 : 0;
-    if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+    if (drive < 0)
+        drive = hybris_is_kwin() || getenv("LIBDRM_HYBRIS_DPMS_FROM_ACTIVE") ? 1 : 0;
+    if (hybris_debug.sample)
         fprintf(stderr, "libdrm-hybris: ConnectorSetProperty conn=%u prop=%u val=%llu drive=%d comp=%d\n",
                 connector_id, property_id, (unsigned long long)value, drive, hybris_is_compositor());
     if (drive && hybris_is_compositor() && !hybris_is_gnome() && g_drm_fd < 0) g_drm_fd = fd;
@@ -1312,13 +1317,13 @@ int drmModeConnectorSetProperty(int fd, uint32_t connector_id, uint32_t property
         int sv = in_hook; in_hook = 1;
         drmModePropertyPtr p = drmModeGetProperty(fd, property_id);
         int is_dpms = (p && strcmp(p->name, "DPMS") == 0);
-        if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+        if (hybris_debug.sample)
             fprintf(stderr, "libdrm-hybris:   prop name=[%s] is_dpms=%d\n", p ? p->name : "(null)", is_dpms);
         if (p) drmModeFreeProperty(p);
         in_hook = sv;
         if (is_dpms) {
             drm_shim_panel_power(value == 0 ? 1 : 0);   /* 0=On -> panel on */
-            if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+            if (hybris_debug.sample)
                 fprintf(stderr, "libdrm-hybris: DPMS property -> %llu (panel %s)\n",
                         (unsigned long long)value, value == 0 ? "ON" : "OFF");
             return 0;
@@ -1334,7 +1339,8 @@ int drmModeObjectSetProperty(int fd, uint32_t object_id, uint32_t object_type,
     typedef int (*fn_t)(int,uint32_t,uint32_t,uint32_t,uint64_t);
     fn_t real=(fn_t)hybris_resolve_next("drmModeObjectSetProperty",(void*)drmModeObjectSetProperty);
     static int drive = -1;
-    if (drive < 0) drive = getenv("LIBDRM_HYBRIS_DPMS_FROM_ACTIVE") ? 1 : 0;
+    if (drive < 0)
+        drive = hybris_is_kwin() || getenv("LIBDRM_HYBRIS_DPMS_FROM_ACTIVE") ? 1 : 0;
     if (drive && hybris_is_compositor() && !hybris_is_gnome()) {
         if (g_drm_fd < 0) g_drm_fd = fd;
         int sv = in_hook; in_hook = 1;
@@ -1344,7 +1350,7 @@ int drmModeObjectSetProperty(int fd, uint32_t object_id, uint32_t object_type,
         in_hook = sv;
         if (is_dpms) {
             drm_shim_panel_power(value == 0 ? 1 : 0);
-            if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+            if (hybris_debug.sample)
                 fprintf(stderr, "libdrm-hybris: DPMS(obj) -> %llu (panel %s)\n",
                         (unsigned long long)value, value == 0 ? "ON" : "OFF");
             return 0;
@@ -1366,7 +1372,7 @@ int drmModeAddFB2WithModifiers(int fd, uint32_t w, uint32_t h, uint32_t fmt,
     if (!frame_w) { frame_w=w; frame_h=h; }
     if (!dumb_map) init_dumb(fd);
     uint32_t id=next_fake++; *buf_id=id; fmap_insert(handles[0],id);
-    if (getenv("LIBDRM_HYBRIS_SAMPLE")) fprintf(stderr,"libdrm-hybris: AddFB2Mod fb=%u handle0=%u\n",id,handles[0]);
+    if (hybris_debug.sample) fprintf(stderr,"libdrm-hybris: AddFB2Mod fb=%u handle0=%u\n",id,handles[0]);
     return 0;
 }
 /* Legacy AddFB. KWin's legacy DRM path (KWIN_DRM_NO_AMS) registers its scanout
@@ -1386,7 +1392,7 @@ int drmModeAddFB(int fd, uint32_t w, uint32_t h, uint8_t depth, uint8_t bpp,
     if (!frame_w) { frame_w=w; frame_h=h; }
     if (!dumb_map) init_dumb(fd);
     uint32_t id=next_fake++; if (buf_id) *buf_id=id; fmap_insert(bo_handle,id);
-    if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+    if (hybris_debug.sample)
         fprintf(stderr, "libdrm-hybris: AddFB fb=%u handle=%u pitch=%u %ux%u bpp=%u\n",
                 id, bo_handle, pitch, w, h, bpp);
     return 0;
@@ -1405,7 +1411,7 @@ int drmModeAddFB2(int fd, uint32_t w, uint32_t h, uint32_t fmt,
     if (!frame_w) { frame_w=w; frame_h=h; }
     if (!dumb_map) init_dumb(fd);
     uint32_t id=next_fake++; *buf_id=id; fmap_insert(handles[0],id);
-    if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+    if (hybris_debug.sample)
         fprintf(stderr, "libdrm-hybris: AddFB2 fb=%u handle0=%u pitch0=%u %ux%u\n",
                 id, handles[0], pitches?pitches[0]:0, w, h);
     return 0;
@@ -1422,7 +1428,7 @@ int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle) {
      * prime_fd -> gralloc mapping (gmap) and find_gralloc()/find_by_fb() key on
      * the prime fd, so AddFB2/commit can still recover the buffer. */
     if (r != 0 && handle) { *handle = (uint32_t)prime_fd; r = 0; }
-    if (getenv("LIBDRM_HYBRIS_SAMPLE") && handle) fprintf(stderr,"libdrm-hybris: PrimeFDToHandle fd=%d -> handle=%u\n",prime_fd,*handle);
+    if (hybris_debug.sample && handle) fprintf(stderr,"libdrm-hybris: PrimeFDToHandle fd=%d -> handle=%u\n",prime_fd,*handle);
     return r;
 }
 /* Reverse of the above: KWin's QPainter (software) compositing backend allocates
@@ -1450,7 +1456,7 @@ int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd) {
     if (r != 0 && prime_fd) {
         int dfd = dup((int)handle);       /* handle == the gbm_hybris prime fd */
         if (dfd >= 0) { *prime_fd = dfd; r = 0; primemap_add(dfd, handle); }
-        if (getenv("LIBDRM_HYBRIS_SAMPLE")) fprintf(stderr,"libdrm-hybris: PrimeHandleToFD handle=%u -> fd=%d\n",handle,dfd);
+        if (hybris_debug.sample) fprintf(stderr,"libdrm-hybris: PrimeHandleToFD handle=%u -> fd=%d\n",handle,dfd);
     }
     return r;
 }
@@ -1500,7 +1506,7 @@ int drmModePageFlip(int fd, uint32_t crtc_id, uint32_t fb_id, uint32_t flags, vo
         return real ? real(fd,crtc_id,fb_id,flags,ud) : -ENOSYS;
     g_drm_fd = fd; synth_note_flip();
     buffer_handle_t h=find_by_fb(fb_id);
-    if (getenv("LIBDRM_HYBRIS_SAMPLE")) {
+    if (hybris_debug.sample) {
         static unsigned long fn = 0;
         if (fn++ < 12)
             fprintf(stderr, "libdrm-hybris: PageFlip fb=%u gem=%u gralloc=%p fmap_n=%d gmap_n=%d\n",
@@ -1585,7 +1591,7 @@ static uint32_t discover_crtc(int fd) {
         drmModeFreeResources(res);
     }
     in_hook = saved;
-    if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+    if (hybris_debug.sample)
         fprintf(stderr, "libdrm-hybris: discovered CRTC id=%u\n", g_crtc_id);
     return g_crtc_id;
 }
@@ -1642,7 +1648,8 @@ static void *panel_ctl_thread(void *unused) {
 
 __attribute__((constructor))
 static void panel_ctl_start(void) {
-    if (!getenv("LIBDRM_HYBRIS_PANEL_CTL")) return;
+    /* No env gate: the is_compositor() check below is the real condition, and
+     * requiring a variable only meant the session could forget it. */
     /* Only the compositor holds an HWC2 display handle. Without this gate every
      * hybris client that inherits the session env (thumbnailers especially --
      * 1125 of them in one boot) spawns a polling thread that can only ever call
@@ -1737,7 +1744,7 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReqPtr req, uint32_t flags, void *u
      * exactly the rapid flicker on any motion (static content = no interleaved
      * empty commits = no flicker). */
     buffer_handle_t h = g_committed_fb ? find_by_fb(g_committed_fb) : NULL;
-    if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+    if (hybris_debug.sample)
         fprintf(stderr, "libdrm-hybris: atomicCommit #%lu flags=0x%x fb=%u h=%p arm=%d\n",
                 g_commit_n, flags, g_committed_fb, (void*)h, (flags & DRM_MODE_PAGE_FLIP_EVENT)?1:0);
     /* DPMS is driven by phoc's output-power handler via drm_shim_panel_power()
@@ -1790,12 +1797,12 @@ int drmModeAtomicCommit(int fd, drmModeAtomicReqPtr req, uint32_t flags, void *u
      * repaint loop stalls after a single frame. */
     if (flags & DRM_MODE_PAGE_FLIP_EVENT) {
         uint32_t crtc = g_committed_crtc ? g_committed_crtc : discover_crtc(fd);
-        if (getenv("LIBDRM_HYBRIS_SAMPLE") && g_commit_n <= 3)
+        if (hybris_debug.sample && g_commit_n <= 3)
             fprintf(stderr, "libdrm-hybris: synth crtc=%u (committed=%u discovered=%u)\n",
                     crtc, g_committed_crtc, discover_crtc(fd));
         synth_arm(crtc, (uint64_t)(uintptr_t)ud);
     }
-    if (getenv("LIBDRM_HYBRIS_SAMPLE")) sample_all_buffers();
+    if (hybris_debug.sample) sample_all_buffers();
     return 0;
 }
 
@@ -1821,7 +1828,7 @@ int ioctl(int fd, unsigned long request, ...) {
         if (!frame_w) { frame_w=c->width; frame_h=c->height; }
         if (!dumb_map) init_dumb(fd);
         uint32_t id=next_fake++; c->fb_id=id; fmap_insert(c->handle,id);
-        if (getenv("LIBDRM_HYBRIS_SAMPLE"))
+        if (hybris_debug.sample)
             fprintf(stderr, "libdrm-hybris: ioctl AddFB fb=%u handle=%u %ux%u\n",
                     id, c->handle, c->width, c->height);
         ret=0;
@@ -1862,7 +1869,7 @@ int ioctl(int fd, unsigned long request, ...) {
          * the compositor's whole frame period (composite + present + pacing). */
         {
             static int prof = -1;
-            if (prof < 0) prof = getenv("LIBDRM_HYBRIS_PROF") ? 1 : 0;
+            if (prof < 0) prof = hybris_debug.profile ? 1 : 0;
             if (prof) {
                 static struct timespec last; static double acc = 0.0, accP = 0.0; static int n = 0;
                 struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
@@ -1884,7 +1891,7 @@ int ioctl(int fd, unsigned long request, ...) {
         }
         if (h) { copy_to_dumb(h); present_hwc2(h); }
         else {
-            if (getenv("LIBDRM_HYBRIS_SAMPLE")) {
+            if (hybris_debug.sample) {
                 static unsigned long miss = 0;
                 if (miss++ < 8)
                     fprintf(stderr, "libdrm-hybris: flip fb=%u UNRESOLVED gem=%u fmap_n=%d gmap_n=%d\n",

@@ -68,6 +68,29 @@ HYBRIS_INTERNAL void hybris_common_init (void);
 HYBRIS_INTERNAL bool hybris_is_compositor (void);
 HYBRIS_INTERNAL bool hybris_is_gnome (void);
 
+/* Compositors whose DRM behaviour differs enough to need their own paths.
+ * Detected from the executable name; the old code required the session to
+ * export LIBDRM_HYBRIS_FAKE_KMS_STATE / HYBRIS_WLROOTS instead, which meant a
+ * session file that forgot them silently got the wrong behaviour. */
+HYBRIS_INTERNAL bool hybris_is_kwin (void);
+HYBRIS_INTERNAL bool hybris_is_wlroots (void);
+
+/* ---- tuning -------------------------------------------------------------
+ * Defaults are the measured-correct values for this stack. Environment
+ * variables exist only to override them when debugging a new device, never as
+ * a requirement -- a missing variable must never silently select a slow or
+ * broken path, which is exactly what LIBDRM_HYBRIS_SYNC and _ROWSTEP used to
+ * do (unset meant a full 31 ms/frame buffer copy, capping the compositor near
+ * 30 fps; the session had to set them to get the fast path). */
+struct hybris_tuning {
+    /* Force the gralloc resolve by touching one cache line every N rows rather
+     * than copying the whole buffer: same result, ~450 us instead of ~31 ms. */
+    bool touch_sync;      /* LIBDRM_HYBRIS_SYNC=copy disables               */
+    int  row_step;        /* LIBDRM_HYBRIS_ROWSTEP=N overrides             */
+};
+
+extern HYBRIS_INTERNAL struct hybris_tuning hybris_tuning;
+
 /* ---- shared state -------------------------------------------------------
  * Previously ~60 loose file-static variables. Grouped by lifetime and owner so
  * it is clear what belongs together and what each module may touch. */
