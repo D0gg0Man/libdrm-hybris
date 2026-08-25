@@ -13,9 +13,10 @@ OUT = built/libdrm-hybris.so
 SRCS = src/libdrm-hybris.c \
        src/common.c \
        src/wlroots.c \
+       src/mutter.c \
        src/kwin.c
 
-HDRS = src/common.h src/wlroots.h src/kwin.h
+HDRS = src/common.h src/wlroots.h src/mutter.h src/kwin.h
 
 .PHONY: all clean install
 

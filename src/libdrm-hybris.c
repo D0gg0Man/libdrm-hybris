@@ -59,16 +59,6 @@
  * a compositor. Non-compositors that call libseat (rare) still get our fake,
  * which is harmless -- they would have used seatd otherwise. */
 /* Runtime session detection */
-/* BUG 4 fix: only inject wlegl into gnome-shell itself, not every
- * wayland server that happens to run in a gnome session */
-static int is_gnome_shell(void) {
-    char buf[256] = {0};
-    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (n < 0) return 0;
-    buf[n] = '\0';
-    return strstr(buf, "gnome-shell") != NULL;
-}
-
 /* BUG 2 fix: resolve the real symbol safely. When this library is
  * installed both as libseat.so.1 AND via ld.so.preload, RTLD_NEXT from
  * the preloaded copy resolves to the libseat.so.1 copy of the SAME
@@ -154,56 +144,6 @@ int drmModeCreateLease(int fd, const uint32_t *o, int n, int f, uint32_t *id) {
         return real ? real(fd,o,n,f,id) : -EINVAL;
     }
     return -EINVAL;
-}
-
-
-/* ==========================================================================
- * 3. EGL -- visual-id fix (phosh) + platform display intercepts (gnome)
- * ========================================================================== */
-
-EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config,
-                               EGLint attribute, EGLint *value) {
-    static EGLBoolean (*real_fn)(EGLDisplay, EGLConfig, EGLint, EGLint *) = NULL;
-    if (!real_fn) real_fn = hybris_resolve_next("eglGetConfigAttrib", (void *)eglGetConfigAttrib);
-    if (!real_fn) return EGL_FALSE;
-    EGLBoolean r = real_fn(dpy, config, attribute, value);
-    /* Visual-id fix is ONLY for wlroots/phoc (phosh), which needs a non-zero
-     * EGL_NATIVE_VISUAL_ID to select a config. It must NOT run for:
-     *  - clients (Qt camera apps) -- they need the unmodified value
-     *  - gnome/mutter -- the drmadapter EGL platform does the proper fourcc
-     *    mapping itself; our forcing it to 1 breaks mutter's GBM format match
-     *    ("No EGL config matching supported GBM format found"). */
-    if (r && hybris_is_compositor() && !hybris_is_gnome() &&
-        attribute == EGL_NATIVE_VISUAL_ID && *value == 0) {
-        EGLint red=0, green=0, blue=0, alpha=0;
-        real_fn(dpy,config,EGL_RED_SIZE,&red);   real_fn(dpy,config,EGL_GREEN_SIZE,&green);
-        real_fn(dpy,config,EGL_BLUE_SIZE,&blue); real_fn(dpy,config,EGL_ALPHA_SIZE,&alpha);
-        if (red==8 && green==8 && blue==8 && alpha==8) *value = 1;
-    }
-    return r;
-}
-
-/* ==========================================================================
- * 4. WAYLAND -- gnome: inject android_wlegl into wl_display on creation
- * ========================================================================== */
-
-typedef void *(*server_wlegl_create_t)(struct wl_display *);
-
-struct wl_display *wl_display_create(void) {
-    typedef struct wl_display *(*fn_t)(void);
-    fn_t real = hybris_resolve_next("wl_display_create", (void *)wl_display_create);
-    if (!real) return NULL;
-    struct wl_display *dpy = real();
-    if (dpy && hybris_is_gnome() && is_gnome_shell()) {
-        void *lib = dlopen("libhybris-platformcommon.so", RTLD_NOW | RTLD_NOLOAD);
-        if (!lib) lib = dlopen("libhybris-platformcommon.so", RTLD_NOW);
-        if (lib) {
-            server_wlegl_create_t create =
-                dlsym(lib, "_Z19server_wlegl_createP10wl_display");
-            if (create) create(dpy);
-        }
-    }
-    return dpy;
 }
 
 
@@ -1341,52 +1281,6 @@ static int g_output_on = 1;          /* current panel power state (init: on) */
  * wlroots stops scheduling frames for client damage on this faked-KMS backend
  * (the screen freezes). Keeping the output enabled and only toggling HWC2 panel
  * power avoids the modeset entirely. */
-/* mutter's blank never reaches the panel on this backend: it calls
- * meta_kms_device_disable(), whose DRM traffic is swallowed here, and with
- * MUTTER_DEBUG_FORCE_KMS_MODE=simple it emits neither an atomic ACTIVE commit
- * nor a DPMS property set nor a legacy CRTC disable -- all three existing
- * detection paths were checked on device and none fire. Rather than keep
- * guessing which ioctl carries it, take the signal from the one place that is
- * unambiguous: gnome-shell's powerManager, which writes this file in
- * _turnOffScreen()/_turnOnScreen(). Values are HWC2-ish: 0 = off, 1 = on. */
-static void *panel_ctl_thread(void *unused) {
-    (void)unused;
-    char path[128];
-    snprintf(path, sizeof path, "/run/user/%u/hybris-display-power",
-             (unsigned)getuid());
-    time_t last = 0;
-    for (;;) {
-        struct stat st;
-        if (stat(path, &st) == 0 && st.st_mtime != last) {
-            last = st.st_mtime;
-            FILE *f = fopen(path, "r");
-            if (f) {
-                int v = -1;
-                if (fscanf(f, "%d", &v) == 1 && (v == 0 || v == 1))
-                    drm_shim_panel_power(v);
-                fclose(f);
-            }
-        }
-        usleep(50000);
-    }
-    return NULL;
-}
-
-__attribute__((constructor))
-static void panel_ctl_start(void) {
-    /* No env gate: the is_compositor() check below is the real condition, and
-     * requiring a variable only meant the session could forget it. */
-    /* Only the compositor holds an HWC2 display handle. Without this gate every
-     * hybris client that inherits the session env (thumbnailers especially --
-     * 1125 of them in one boot) spawns a polling thread that can only ever call
-     * setPowerMode with a NULL handle. A battery fix should not ship idle
-     * pollers in every process on the system. */
-    if (!hybris_is_compositor()) return;
-    pthread_t t;
-    if (pthread_create(&t, NULL, panel_ctl_thread, NULL) == 0)
-        pthread_detach(t);
-}
-
 void drm_shim_panel_power(int on) {
     on = on ? 1 : 0;
     if (on == g_output_on) return;

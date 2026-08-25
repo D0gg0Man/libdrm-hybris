@@ -20,6 +20,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <EGL/egl.h>
+
 /* ==========================================================================
  * 1. LIBSEAT -- fake API for phosh/phoc running outside seatd
  * ========================================================================== */
@@ -97,4 +99,36 @@ int         libseat_switch_session(struct libseat *s, int n) { (void)s; (void)n;
 int         libseat_disable_seat(struct libseat *s)          { (void)s; return 0; }
 void        libseat_set_log_handler(void *handler, void *data) { (void)handler; (void)data; }
 void        libseat_set_log_level(int level)                 { (void)level; }
+
+
+/* ---- EGL visual id -------------------------------------------------------
+ * wlroots needs a non-zero EGL_NATIVE_VISUAL_ID to pick a config, and the
+ * hybris EGL reports 0. Fill one in for 8888 configs.
+ *
+ * Deliberately NOT applied elsewhere: ordinary clients (Qt camera apps) need
+ * the unmodified value, and under mutter the drmadapter platform does the
+ * proper fourcc mapping itself -- forcing 1 there breaks its GBM format match
+ * ("No EGL config matching supported GBM format found"). */
+
+EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config,
+                               EGLint attribute, EGLint *value) {
+    static EGLBoolean (*real_fn)(EGLDisplay, EGLConfig, EGLint, EGLint *) = NULL;
+    if (!real_fn) real_fn = hybris_resolve_next("eglGetConfigAttrib", (void *)eglGetConfigAttrib);
+    if (!real_fn) return EGL_FALSE;
+    EGLBoolean r = real_fn(dpy, config, attribute, value);
+    /* Visual-id fix is ONLY for wlroots/phoc (phosh), which needs a non-zero
+     * EGL_NATIVE_VISUAL_ID to select a config. It must NOT run for:
+     *  - clients (Qt camera apps) -- they need the unmodified value
+     *  - gnome/mutter -- the drmadapter EGL platform does the proper fourcc
+     *    mapping itself; our forcing it to 1 breaks mutter's GBM format match
+     *    ("No EGL config matching supported GBM format found"). */
+    if (r && hybris_is_compositor() && !hybris_is_gnome() &&
+        attribute == EGL_NATIVE_VISUAL_ID && *value == 0) {
+        EGLint red=0, green=0, blue=0, alpha=0;
+        real_fn(dpy,config,EGL_RED_SIZE,&red);   real_fn(dpy,config,EGL_GREEN_SIZE,&green);
+        real_fn(dpy,config,EGL_BLUE_SIZE,&blue); real_fn(dpy,config,EGL_ALPHA_SIZE,&alpha);
+        if (red==8 && green==8 && blue==8 && alpha==8) *value = 1;
+    }
+    return r;
+}
 
